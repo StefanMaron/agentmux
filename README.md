@@ -104,6 +104,8 @@ Open `http://localhost:7070` to see every active session across every project, g
 
 **`mode`** values (Copilot / Claude Code): `agent` (default), `plan`, `autopilot`
 
+> **Note:** Background agents always run in **yolo mode** — they auto-approve all file edits and shell commands without prompting. This is intentional: subagents are unattended by design. Review their output (via `agent_wait` or the dashboard) before merging or running produced code.
+
 ## Provider guide
 
 ### Free — no quota
