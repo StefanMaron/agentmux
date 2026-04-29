@@ -88,6 +88,9 @@ class CopilotAdapter(AgentAdapter):
         # Session state.
         self._acp_session_id: str | None = None
         self._output_buffer: list[str] = []
+        # Persistent stream for the dashboard — never drained, accumulates all
+        # visible events (agent text, tool calls, shell output, etc.).
+        self._all_chunks: list[dict] = []
         self._done = asyncio.Event()
         self._done.set()  # idle by default; cleared when a prompt is in flight
         self._current_prompt_id: int | None = None
@@ -383,16 +386,36 @@ class CopilotAdapter(AgentAdapter):
     def _handle_session_update(self, params: dict[str, Any]) -> None:
         update = params.get("update") or {}
         kind = update.get("sessionUpdate")
+        content = update.get("content") or {}
+
         if kind == "agent_message_chunk":
-            content = update.get("content") or {}
             if content.get("type") == "text":
                 text = content.get("text") or ""
                 if text:
                     self._output_buffer.append(text)
+                    self._all_chunks.append({"kind": "text", "text": text})
+
         elif kind == "agent_thought_chunk":
-            # We ignore thinking chunks for the user-visible buffer.
-            pass
-        # Other update kinds (tool_call, plan, etc.) are silently dropped for now.
+            if content.get("type") == "text":
+                text = content.get("text") or ""
+                if text:
+                    self._all_chunks.append({"kind": "think", "text": text})
+
+        elif kind in ("tool_call_chunk", "tool_call"):
+            # Surface tool name + args so the user can see what's running
+            name = content.get("name") or update.get("name") or ""
+            args = content.get("arguments") or content.get("input") or ""
+            if isinstance(args, dict):
+                import json as _json
+                args = _json.dumps(args, separators=(",", ":"))
+            label = f"⚙ {name}({str(args)[:120]})\n" if name else ""
+            if label:
+                self._all_chunks.append({"kind": "tool", "text": label})
+
+        elif kind == "tool_result_chunk":
+            result = content.get("text") or content.get("output") or ""
+            if result:
+                self._all_chunks.append({"kind": "tool", "text": f"  → {str(result)[:300]}\n"})
 
     def _drain_output(self) -> str:
         text = "".join(self._output_buffer)

@@ -309,13 +309,14 @@ async def _sse_stream(
         await writer.drain()
         return
 
-    # Send existing buffer as history first
-    buf = list(getattr(session.adapter, "_output_buffer", []))
-    if buf:
-        writer.write(send("history", {"text": "".join(buf)}))
+    # Replay existing chunks as history first (typed chunks with kind)
+    all_chunks: list[dict] = list(getattr(session.adapter, "_all_chunks", []))
+    for chunk in all_chunks:
+        writer.write(send("chunk", chunk))
+    if all_chunks:
         await writer.drain()
 
-    last_len = len(buf)
+    last_len = len(all_chunks)
 
     # Stream new chunks as they arrive
     while True:
@@ -328,15 +329,12 @@ async def _sse_stream(
 
         writer.write(send("status", {"status": status}))
 
-        # Flush any new buffer chunks
-        current_buf = list(getattr(session.adapter, "_output_buffer", []))
-        if len(current_buf) > last_len:
-            for chunk in current_buf[last_len:]:
-                kind = "text"
-                if chunk.startswith("\x1b") or any(c in chunk for c in ["🔧", "⚙"]):
-                    kind = "tool"
-                writer.write(send("chunk", {"text": chunk, "kind": kind}))
-            last_len = len(current_buf)
+        # Flush any new typed chunks
+        current_chunks: list[dict] = list(getattr(session.adapter, "_all_chunks", []))
+        if len(current_chunks) > last_len:
+            for chunk in current_chunks[last_len:]:
+                writer.write(send("chunk", chunk))
+            last_len = len(current_chunks)
 
         await writer.drain()
 
