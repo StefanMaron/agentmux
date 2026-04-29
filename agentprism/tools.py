@@ -153,8 +153,8 @@ def tool_definitions() -> list[dict[str, Any]]:
         {
             "name": "agent_send",
             "description": (
-                "Send a follow-up message to a running agent session and block "
-                "until the agent finishes responding. Returns the agent's output."
+                "Send a correction or follow-up message to a running agent session. "
+                "Non-blocking — returns immediately. Use agent_wait or agent_status to observe the result."
             ),
             "inputSchema": {
                 "type": "object",

@@ -88,8 +88,7 @@ class GeminiAdapter(AgentAdapter):
         sess.done_event.clear()
         sess.status = "working"
         await self._run_turn(sess, message, is_first=False)
-        await sess.done_event.wait()
-        return sess.output
+        return "message sent — use agent_wait or agent_status to observe"
 
     async def status(self, session_id: str) -> str:
         return self._require(session_id).status

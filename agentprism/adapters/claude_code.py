@@ -204,21 +204,16 @@ class ClaudeCodeAdapter(AgentAdapter):
         return session_id
 
     async def send(self, session_id: str, message: str) -> str:
-        """Send a follow-up message and wait for the agent's response."""
+        """Send a follow-up message non-blocking — use agent_wait/status to observe."""
         sess = self._require(session_id)
         async with sess.send_lock:
-            # Make sure no earlier turn is still running. (The registry
-            # normally serialises this for us, but be defensive.)
             if sess.state == "working":
                 await self._await_turn(sess, timeout=None)
             sess.turn_done.clear()
             sess.pending_text.clear()
             sess.state = "working"
             await self._write_user_message(sess, message)
-            await self._await_turn(sess, timeout=None)
-            if sess.state == "error":
-                raise RuntimeError(sess.error or "claude subprocess errored")
-            return sess.last_result
+        return "message sent — use agent_wait or agent_status to observe"
 
     async def status(self, session_id: str) -> str:
         sess = self._require(session_id)

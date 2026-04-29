@@ -101,12 +101,13 @@ class CopilotAdapter(AgentAdapter):
 
     async def send(self, session_id: str, message: str) -> str:
         sess = self._require(session_id)
-        await sess.done_event.wait()
+        await sess.done_event.wait()  # wait for any in-flight turn to finish
         sess.done_event.clear()
         sess.status = "working"
         await self._run_turn(sess, message, is_first=False)
-        await sess.done_event.wait()
-        return sess.output
+        # Non-blocking — return immediately so Claude isn't stuck waiting.
+        # Use agent_wait/agent_status to observe the result.
+        return "message sent — use agent_wait or agent_status to observe"
 
     async def status(self, session_id: str) -> str:
         sess = self._require(session_id)
