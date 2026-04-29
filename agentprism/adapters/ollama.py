@@ -17,7 +17,12 @@ import urllib.request
 import uuid
 from dataclasses import dataclass, field
 
-from agentprism.adapters.base import AgentAdapter, ProviderStatus
+from agentprism.adapters.base import (
+    AgentAdapter,
+    ProviderStatus,
+    QuotaExceededError,
+    detect_quota_error,
+)
 
 log = logging.getLogger(__name__)
 
@@ -283,9 +288,21 @@ class OllamaAdapter(AgentAdapter):
         sess.output = "".join(text_parts)
 
         if error and not sess.output.strip():
-            sess.status = "error"
-            sess.output = error
-            sess.all_chunks.append({"kind": "text", "text": f"[error] {error}\n"})
+            error_lower = error.lower()
+            if "connection" in error_lower or "refused" in error_lower or "unreachable" in error_lower:
+                quota_err: QuotaExceededError | None = QuotaExceededError(
+                    "ollama", sess.model, "Ollama server not running or no models available"
+                )
+            else:
+                quota_err = detect_quota_error(error, "ollama", sess.model)
+            if quota_err:
+                sess.status = "error"
+                sess.output = str(quota_err)
+                sess.all_chunks.append({"kind": "text", "text": f"[error] {sess.output}\n"})
+            else:
+                sess.status = "error"
+                sess.output = error
+                sess.all_chunks.append({"kind": "text", "text": f"[error] {error}\n"})
         else:
             sess.status = "done"
             # Persist assistant turn into history for follow-ups.

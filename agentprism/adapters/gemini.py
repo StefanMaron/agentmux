@@ -18,7 +18,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 
-from agentprism.adapters.base import AgentAdapter, ProviderStatus
+from agentprism.adapters.base import AgentAdapter, ProviderStatus, detect_quota_error
 
 log = logging.getLogger(__name__)
 
@@ -248,10 +248,14 @@ class GeminiAdapter(AgentAdapter):
 
         sess.output = "\n".join(text_parts) if text_parts else ""
 
-        if sess.proc.returncode != 0 and not sess.output.strip():
-            err = b"".join(stderr_chunks).decode("utf-8", errors="replace")
+        err_text = b"".join(stderr_chunks).decode("utf-8", errors="replace")
+        quota_err = detect_quota_error(err_text + "\n" + sess.output, "gemini", sess.model)
+        if quota_err:
             sess.status = "error"
-            sess.output = err or f"gemini exited with code {sess.proc.returncode}"
+            sess.output = str(quota_err)
+        elif sess.proc.returncode != 0 and not sess.output.strip():
+            sess.status = "error"
+            sess.output = err_text or f"gemini exited with code {sess.proc.returncode}"
         else:
             sess.status = "done"
 

@@ -25,3 +25,4 @@ htmlcov/
 .idea/
 .vscode/
 .DS_Store
+.aider*

@@ -26,6 +26,22 @@ from agentprism.session import PROVIDERS, SessionRegistry, git_delta
 
 DEFAULT_PROVIDER = os.environ.get("AGENTPRISM_DEFAULT_PROVIDER", "")
 
+
+def _quota_error_response(output: str, session: Any) -> dict | None:
+    """Return a structured quota-exceeded error dict if output signals a quota error."""
+    if not output.startswith("[quota_exceeded]"):
+        return None
+    return {
+        "error": "quota_exceeded",
+        "provider": session.provider,
+        "model": session.model or "unknown",
+        "message": output,
+        "suggestion": (
+            "Try provider='ollama', model='qwen2.5-coder:14b-8k' for free local inference, "
+            "or provider='gemini', model='gemini-2.5-flash' for free cloud inference."
+        ),
+    }
+
 # ---------------------------------------------------------------------- schemas
 
 
@@ -286,6 +302,9 @@ class ToolDispatcher:
         try:
             import asyncio
             output = await session.adapter.wait(session.session_id, timeout=timeout_seconds)
+            quota_resp = _quota_error_response(output, session)
+            if quota_resp:
+                return quota_resp
             delta = await asyncio.get_event_loop().run_in_executor(
                 None, git_delta, session.cwd, session.git_base_sha
             )
@@ -330,6 +349,16 @@ class ToolDispatcher:
         delta = await asyncio.get_event_loop().run_in_executor(
             None, git_delta, session.cwd, session.git_base_sha
         )
+        if status == "error":
+            try:
+                output = await asyncio.wait_for(
+                    session.adapter.wait(session_id), timeout=2.0
+                )
+                quota_resp = _quota_error_response(output, session)
+                if quota_resp:
+                    return {"session_id": session_id, "status": status, **delta, **quota_resp}
+            except Exception:
+                pass
         result: dict = {"session_id": session_id, "status": status, **delta}
         # Add provider-specific activity info if available (e.g. log tailing, frame counts)
         if hasattr(session.adapter, "activity_info"):
@@ -343,6 +372,9 @@ class ToolDispatcher:
         session = self.registry.get(session_id)
         try:
             output = await session.adapter.wait(session_id, timeout=timeout_seconds)
+            quota_resp = _quota_error_response(output, session)
+            if quota_resp:
+                return {"session_id": session_id, **quota_resp}
             delta = await asyncio.get_event_loop().run_in_executor(
                 None, git_delta, session.cwd, session.git_base_sha
             )

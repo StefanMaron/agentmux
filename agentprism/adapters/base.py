@@ -7,6 +7,37 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 
+class QuotaExceededError(RuntimeError):
+    def __init__(self, provider: str, model: str, retry_after: str | None = None):
+        self.provider = provider
+        self.model = model
+        self.retry_after = retry_after
+        msg = f"[quota_exceeded] {provider} quota exceeded for model {model}."
+        if retry_after:
+            msg += f" Retry after: {retry_after}."
+        msg += " Try a different provider or model."
+        super().__init__(msg)
+
+
+QUOTA_PATTERNS = [
+    "429", "quota exceeded", "rate limit", "rate_limit", "exhausted",
+    "too many requests", "resource_exhausted", "resource exhausted",
+    "insufficient_quota", "exceeded your current quota",
+]
+
+
+def detect_quota_error(text: str, provider: str, model: str | None = None) -> QuotaExceededError | None:
+    lower = text.lower()
+    if any(p in lower for p in QUOTA_PATTERNS):
+        retry = None
+        for line in text.splitlines():
+            if "retry" in line.lower() and any(c.isdigit() for c in line):
+                retry = line.strip()[:80]
+                break
+        return QuotaExceededError(provider, model or "unknown", retry)
+    return None
+
+
 @dataclass
 class ProviderStatus:
     provider: str

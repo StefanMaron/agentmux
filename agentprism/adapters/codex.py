@@ -51,7 +51,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-from agentprism.adapters.base import AgentAdapter, ProviderStatus
+from agentprism.adapters.base import AgentAdapter, ProviderStatus, detect_quota_error
 
 
 class NotInstalledError(RuntimeError):
@@ -340,6 +340,8 @@ class CodexAdapter(AgentAdapter):
         assert proc.stdout is not None
         assert proc.stderr is not None
 
+        stderr_lines: list[str] = []
+
         async def read_stdout() -> None:
             assert proc.stdout is not None
             while True:
@@ -364,9 +366,9 @@ class CodexAdapter(AgentAdapter):
                 line = await proc.stderr.readline()
                 if not line:
                     return
+                stderr_lines.append(line.decode("utf-8", errors="replace").rstrip("\n"))
                 # Codex logs go to stderr; keep them for diagnostics but don't
                 # surface them as model output unless we have nothing else.
-                # (No-op here; we still capture via output_buf fallback below.)
 
         try:
             await asyncio.gather(read_stdout(), read_stderr())
@@ -397,6 +399,15 @@ class CodexAdapter(AgentAdapter):
                         )
                 else:
                     sess.state = "done"
+
+            # Check for quota errors in stderr + last_error.
+            if sess.state == "error":
+                stderr_text = "\n".join(stderr_lines)
+                combined = stderr_text + "\n" + (sess.last_error or "")
+                quota_err = detect_quota_error(combined, "codex", sess.model)
+                if quota_err:
+                    sess.last_error = str(quota_err)
+
             sess.done_event.set()
 
     def _handle_event(self, event: dict[str, Any], sess: _CodexSession) -> None:
@@ -425,6 +436,11 @@ class CodexAdapter(AgentAdapter):
             else:
                 sess.last_error = event.get("message") or str(err)
             sess.state = "error"
+            # Check for quota error in the error message.
+            if sess.last_error:
+                quota_err = detect_quota_error(sess.last_error, "codex", sess.model)
+                if quota_err:
+                    sess.last_error = str(quota_err)
             sess.done_event.set()
             return
 
@@ -443,6 +459,8 @@ class CodexAdapter(AgentAdapter):
 
     def _collect_output(self, sess: _CodexSession) -> str:
         if sess.state == "error" and sess.last_error:
+            if sess.last_error.startswith("[quota_exceeded]"):
+                return sess.last_error
             joined = "".join(sess.output_buf).strip()
             if joined:
                 return f"{joined}\n\n[codex error] {sess.last_error}"
