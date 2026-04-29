@@ -76,7 +76,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-from agentprism.adapters.base import AgentAdapter
+from agentprism.adapters.base import AgentAdapter, ProviderStatus
 
 # ---------------------------------------------------------------------------
 # Internal session bookkeeping
@@ -288,6 +288,18 @@ class ClaudeCodeAdapter(AgentAdapter):
                 "note": "Strongest reasoning. Use for complex refactors and design.",
             },
         ]
+
+    @classmethod
+    def check_available(cls) -> ProviderStatus:
+        import pathlib
+        installed = cls._binary_installed(cls.binary)
+        if not installed:
+            return ProviderStatus("claude", False, False, f"'{cls.binary}' not found in PATH")
+        # Auth: claude stores credentials in ~/.claude/
+        auth_file = pathlib.Path.home() / ".claude" / ".credentials.json"
+        authenticated = auth_file.exists()
+        note = "" if authenticated else "run 'claude' and log in to authenticate"
+        return ProviderStatus("claude", True, authenticated, note)
 
     # ------------------------------------------------------------------
     # Internal helpers

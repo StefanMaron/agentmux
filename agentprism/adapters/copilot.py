@@ -31,7 +31,7 @@ import logging
 import os
 from typing import Any
 
-from agentprism.adapters.base import AgentAdapter
+from agentprism.adapters.base import AgentAdapter, ProviderStatus
 
 log = logging.getLogger(__name__)
 
@@ -99,6 +99,18 @@ class CopilotAdapter(AgentAdapter):
     @classmethod
     def models(cls) -> list[dict]:
         return [dict(m) for m in COPILOT_MODELS]
+
+    @classmethod
+    def check_available(cls) -> ProviderStatus:
+        import pathlib
+        installed = cls._binary_installed(COPILOT_BINARY)
+        if not installed:
+            return ProviderStatus("copilot", False, False, f"'{COPILOT_BINARY}' not found in PATH")
+        # Auth: copilot stores session in ~/.copilot/
+        auth_dir = pathlib.Path.home() / ".copilot"
+        authenticated = auth_dir.is_dir() and any(auth_dir.iterdir())
+        note = "" if authenticated else "run 'copilot login' to authenticate"
+        return ProviderStatus("copilot", True, authenticated, note)
 
     async def spawn(
         self,

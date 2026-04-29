@@ -51,7 +51,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-from agentprism.adapters.base import AgentAdapter
+from agentprism.adapters.base import AgentAdapter, ProviderStatus
 
 
 class NotInstalledError(RuntimeError):
@@ -250,6 +250,21 @@ class CodexAdapter(AgentAdapter):
                         "tasks.",
             },
         ]
+
+    @classmethod
+    def check_available(cls) -> ProviderStatus:
+        import pathlib
+        binary = "codex"
+        installed = cls._binary_installed(binary)
+        if not installed:
+            return ProviderStatus("codex", False, False, f"'{binary}' not found — install with: npm install -g @openai/codex")
+        # Auth: API key env var or ~/.codex/ config
+        import os
+        has_key = bool(os.environ.get("OPENAI_API_KEY"))
+        has_config = (pathlib.Path.home() / ".codex").is_dir()
+        authenticated = has_key or has_config
+        note = "" if authenticated else "set OPENAI_API_KEY or run 'codex login'"
+        return ProviderStatus("codex", True, authenticated, note)
 
     # ----- internals --------------------------------------------------------
 

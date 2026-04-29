@@ -6,21 +6,25 @@ shared :class:`SessionRegistry`.
 
 Tools
 -----
-* ``agent_models``  — list models for a provider (or all providers)
-* ``agent_spawn``   — start an agent in the background
-* ``agent_send``    — send a message and block for the response
-* ``agent_status``  — working / idle / done / error
-* ``agent_wait``    — block until the current turn finishes
-* ``agent_list``    — enumerate active sessions
-* ``agent_kill``    — terminate a session
+* ``agent_providers`` — which providers are installed and authenticated
+* ``agent_models``    — list models for a provider (or all providers)
+* ``agent_spawn``     — start an agent in the background
+* ``agent_send``      — send a message and block for the response
+* ``agent_status``    — working / idle / done / error
+* ``agent_wait``      — block until the current turn finishes
+* ``agent_list``      — enumerate active sessions
+* ``agent_kill``      — terminate a session
 """
 
 from __future__ import annotations
 
 import json
+import os
 from typing import Any
 
 from agentprism.session import PROVIDERS, SessionRegistry
+
+DEFAULT_PROVIDER = os.environ.get("AGENTPRISM_DEFAULT_PROVIDER", "")
 
 # ---------------------------------------------------------------------- schemas
 
@@ -28,6 +32,20 @@ from agentprism.session import PROVIDERS, SessionRegistry
 def tool_definitions() -> list[dict[str, Any]]:
     """Return the JSON-schema definitions for every agentprism tool."""
     return [
+        {
+            "name": "agent_providers",
+            "description": (
+                "Check which coding-agent providers are installed and authenticated "
+                "on this machine. Call this before agent_spawn when you don't know "
+                "which providers are available. Only spawn workers for providers "
+                "where available=true."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        },
         {
             "name": "agent_models",
             "description": (
@@ -52,7 +70,12 @@ def tool_definitions() -> list[dict[str, Any]]:
             "description": (
                 "Spawn a coding agent in the background with an initial task. "
                 "Returns immediately with a session_id; the agent keeps working. "
-                "Use agent_wait or agent_status to observe progress."
+                "Use agent_wait or agent_status to observe progress. "
+                "Provider selection guide: call agent_providers first if unsure what's available. "
+                "Prefer 'copilot' for implementation tasks (1x cost, GPT/Claude models). "
+                "Use 'claude' when deep reasoning or Claude's specific tools are needed. "
+                "Use 'codex' when you have an OPENAI_API_KEY and want OpenAI models. "
+                f"Default provider (if omitted): '{DEFAULT_PROVIDER or 'copilot'}'."
             ),
             "inputSchema": {
                 "type": "object",
@@ -68,7 +91,10 @@ def tool_definitions() -> list[dict[str, Any]]:
                     "provider": {
                         "type": "string",
                         "enum": sorted(PROVIDERS.keys()),
-                        "description": "Which coding agent to use.",
+                        "description": (
+                            "Which coding agent to use: 'copilot', 'claude', or 'codex'. "
+                            "Omit to use the default (AGENTPRISM_DEFAULT_PROVIDER env var, or 'copilot')."
+                        ),
                     },
                     "model": {
                         "type": "string",
@@ -77,12 +103,11 @@ def tool_definitions() -> list[dict[str, Any]]:
                     "mode": {
                         "type": "string",
                         "description": (
-                            "Optional ACP session mode. For copilot: "
-                            "'agent' (default), 'plan', or 'autopilot'."
+                            "Optional session mode: 'agent' (default), 'plan', or 'autopilot'."
                         ),
                     },
                 },
-                "required": ["task", "cwd", "provider"],
+                "required": ["task", "cwd"],
                 "additionalProperties": False,
             },
         },
@@ -175,6 +200,19 @@ class ToolDispatcher:
 
     # -- handlers ------------------------------------------------------------
 
+    async def _tool_agent_providers(self) -> dict:
+        results = []
+        for name, cls in PROVIDERS.items():
+            status = cls.check_available()
+            results.append({
+                "provider": name,
+                "available": status.available,
+                "installed": status.installed,
+                "authenticated": status.authenticated,
+                "note": status.note,
+            })
+        return {"providers": results}
+
     async def _tool_agent_models(self, provider: str | None = None) -> dict:
         if provider is not None:
             cls = self.registry.adapter_class(provider)
@@ -189,10 +227,12 @@ class ToolDispatcher:
         self,
         task: str,
         cwd: str,
-        provider: str,
+        provider: str | None = None,
         model: str | None = None,
         mode: str | None = None,
     ) -> dict:
+        if not provider:
+            provider = DEFAULT_PROVIDER or "copilot"
         session = await self.registry.spawn(
             provider=provider, task=task, cwd=cwd, model=model, mode=mode
         )

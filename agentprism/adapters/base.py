@@ -2,7 +2,21 @@
 
 from __future__ import annotations
 
+import shutil
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+
+
+@dataclass
+class ProviderStatus:
+    provider: str
+    installed: bool
+    authenticated: bool
+    note: str = ""
+
+    @property
+    def available(self) -> bool:
+        return self.installed and self.authenticated
 
 
 class AgentAdapter(ABC):
@@ -57,3 +71,12 @@ class AgentAdapter(ABC):
         Each entry is a dict with at least ``id`` and ``multiplier`` keys,
         and optionally a ``note`` describing intended use.
         """
+
+    @classmethod
+    @abstractmethod
+    def check_available(cls) -> ProviderStatus:
+        """Return availability/auth status without making any API calls."""
+
+    @classmethod
+    def _binary_installed(cls, binary: str) -> bool:
+        return shutil.which(binary) is not None
