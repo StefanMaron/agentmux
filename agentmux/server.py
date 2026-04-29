@@ -16,7 +16,8 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
-from agentmux.session import SessionRegistry
+from agentmux.notifications import MCPContextHolder, notify_session_complete
+from agentmux.session import Session, SessionRegistry
 from agentmux.tools import ToolDispatcher, tool_definitions
 
 log = logging.getLogger("agentmux")
@@ -33,14 +34,33 @@ def _configure_logging() -> None:
     )
 
 
-def build_server() -> tuple[Server, SessionRegistry]:
-    """Construct the MCP server and its dependencies."""
-    registry = SessionRegistry()
-    dispatcher = ToolDispatcher(registry)
+def build_server() -> tuple[Server, SessionRegistry, MCPContextHolder]:
+    """Construct the MCP server and its dependencies.
+
+    Also returns the :class:`MCPContextHolder` used to bridge the lowlevel
+    SDK's per-request ``ServerSession`` reference into the long-running
+    completion-watcher tasks owned by :class:`SessionRegistry`. The holder
+    starts empty and is populated lazily on the first tool call (the
+    earliest moment the SDK exposes the session via its ``ContextVar``).
+    """
+    holder = MCPContextHolder()
     server: Server = Server("agentmux")
+
+    async def _on_session_complete(session: Session, output: str) -> None:
+        # Best-effort wake-up nudge to the orchestrating client.
+        await notify_session_complete(session, output, holder)
+
+    registry = SessionRegistry(on_complete=_on_session_complete)
+    dispatcher = ToolDispatcher(registry)
 
     @server.list_tools()
     async def _list_tools() -> list[Tool]:
+        # Capture the live ServerSession on every entry — the first call
+        # populates the holder so background notifications can use it.
+        try:
+            holder.capture(server.request_context.session)
+        except LookupError:  # pragma: no cover — request context missing
+            pass
         return [
             Tool(
                 name=t["name"],
@@ -52,6 +72,11 @@ def build_server() -> tuple[Server, SessionRegistry]:
 
     @server.call_tool()
     async def _call_tool(name: str, arguments: dict | None) -> list[TextContent]:
+        # Capture the active session for outbound sampling/log notifications.
+        try:
+            holder.capture(server.request_context.session)
+        except LookupError:  # pragma: no cover — request context missing
+            pass
         try:
             result = await dispatcher.call(name, arguments or {})
         except Exception as e:  # noqa: BLE001
@@ -59,12 +84,12 @@ def build_server() -> tuple[Server, SessionRegistry]:
             return [TextContent(type="text", text=f"ERROR: {type(e).__name__}: {e}")]
         return [TextContent(type="text", text=result)]
 
-    return server, registry
+    return server, registry, holder
 
 
 async def run() -> None:
     _configure_logging()
-    server, registry = build_server()
+    server, registry, holder = build_server()
     log.info("agentmux starting (pid=%d)", os.getpid())
     try:
         async with stdio_server() as (read_stream, write_stream):
@@ -76,6 +101,7 @@ async def run() -> None:
     finally:
         log.info("agentmux shutting down — killing %d sessions", len(registry.list()))
         await registry.shutdown()
+        holder.clear()
 
 
 def main() -> None:
