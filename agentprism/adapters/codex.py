@@ -188,7 +188,7 @@ class CodexAdapter(AgentAdapter):
         sess = self._require_session(session_id)
         try:
             await asyncio.wait_for(sess.done_event.wait(), timeout=timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return self._collect_output(sess)
         return self._collect_output(sess)
 
@@ -200,7 +200,7 @@ class CodexAdapter(AgentAdapter):
                 proc.terminate()
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=5.0)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     proc.kill()
                     await proc.wait()
             except ProcessLookupError:
@@ -361,7 +361,7 @@ class CodexAdapter(AgentAdapter):
             # canonical assistant output for this turn.
             if sess.last_message_file and os.path.exists(sess.last_message_file):
                 try:
-                    with open(sess.last_message_file, "r", encoding="utf-8") as f:
+                    with open(sess.last_message_file, encoding="utf-8") as f:
                         last = f.read().strip()
                     if last:
                         sess.output_buf.append(last)

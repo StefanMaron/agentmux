@@ -6,7 +6,7 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from agentprism.adapters.base import AgentAdapter
 from agentprism.adapters.claude_code import ClaudeCodeAdapter
@@ -38,7 +38,7 @@ class Session:
     model: str | None
     mode: str | None
     initial_task: str
-    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     def summary(self) -> dict:
         return {
@@ -122,7 +122,7 @@ class SessionRegistry:
         try:
             try:
                 output = await session.adapter.wait(session.session_id)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 # Surface the error in the callback payload rather than
                 # silently dropping the notification — the orchestrator
                 # likely still wants to know the worker is gone.
@@ -130,7 +130,7 @@ class SessionRegistry:
             if self._on_complete is not None:
                 try:
                     await self._on_complete(session, output)
-                except Exception:  # noqa: BLE001
+                except Exception:
                     log.exception(
                         "on_complete callback failed for session %s",
                         session.session_id,
@@ -169,6 +169,6 @@ class SessionRegistry:
         for session in list(self._sessions.values()):
             try:
                 await session.adapter.kill(session.session_id)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
         self._sessions.clear()

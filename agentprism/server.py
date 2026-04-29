@@ -79,7 +79,7 @@ def build_server() -> tuple[Server, SessionRegistry, MCPContextHolder]:
             pass
         try:
             result = await dispatcher.call(name, arguments or {})
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             log.exception("Tool %s failed", name)
             return [TextContent(type="text", text=f"ERROR: {type(e).__name__}: {e}")]
         return [TextContent(type="text", text=result)]

@@ -22,7 +22,6 @@ from typing import Any
 
 from agentprism.session import PROVIDERS, SessionRegistry
 
-
 # ---------------------------------------------------------------------- schemas
 
 

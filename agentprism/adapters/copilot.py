@@ -184,7 +184,7 @@ class CopilotAdapter(AgentAdapter):
             return self._drain_output()
         try:
             await asyncio.wait_for(self._done.wait(), timeout=timeout)
-        except asyncio.TimeoutError as e:
+        except TimeoutError as e:
             raise TimeoutError(
                 f"Timed out after {timeout}s waiting for copilot session {session_id}"
             ) from e
@@ -201,7 +201,7 @@ class CopilotAdapter(AgentAdapter):
                     self._request("session/close", {"sessionId": self._acp_session_id}),
                     timeout=2.0,
                 )
-            except (asyncio.TimeoutError, Exception) as e:  # noqa: BLE001
+            except (TimeoutError, Exception) as e:
                 log.debug("session/close failed (ignored): %s", e)
 
         if self._proc and self._proc.returncode is None:
@@ -209,7 +209,7 @@ class CopilotAdapter(AgentAdapter):
                 self._proc.terminate()
                 try:
                     await asyncio.wait_for(self._proc.wait(), timeout=3.0)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     self._proc.kill()
                     await self._proc.wait()
             except ProcessLookupError:
@@ -220,7 +220,7 @@ class CopilotAdapter(AgentAdapter):
                 task.cancel()
                 try:
                     await task
-                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                except (asyncio.CancelledError, Exception):
                     pass
 
         # Fail any still-pending futures.
@@ -258,7 +258,7 @@ class CopilotAdapter(AgentAdapter):
             "sessionId": self._acp_session_id,
             "prompt": [{"type": "text", "text": text}],
         }
-        asyncio.create_task(
+        asyncio.create_task(  # noqa: RUF006
             self._send_frame(
                 {"jsonrpc": "2.0", "id": prompt_id, "method": "session/prompt", "params": params}
             )
@@ -314,7 +314,7 @@ class CopilotAdapter(AgentAdapter):
                 self._dispatch(frame)
         except asyncio.CancelledError:
             raise
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             log.exception("copilot reader crashed: %s", e)
             self._error = str(e)
         finally:
@@ -335,7 +335,7 @@ class CopilotAdapter(AgentAdapter):
                 log.debug("copilot stderr: %s", line.decode("utf-8", errors="replace").rstrip())
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
 
     def _dispatch(self, frame: dict[str, Any]) -> None:

@@ -78,7 +78,6 @@ from typing import Any
 
 from agentprism.adapters.base import AgentAdapter
 
-
 # ---------------------------------------------------------------------------
 # Internal session bookkeeping
 # ---------------------------------------------------------------------------
@@ -249,11 +248,11 @@ class ClaudeCodeAdapter(AgentAdapter):
             pass
         try:
             await asyncio.wait_for(sess.proc.wait(), timeout=2.0)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             try:
                 sess.proc.send_signal(signal.SIGTERM)
                 await asyncio.wait_for(sess.proc.wait(), timeout=2.0)
-            except (asyncio.TimeoutError, ProcessLookupError):
+            except (TimeoutError, ProcessLookupError):
                 try:
                     sess.proc.kill()
                 except ProcessLookupError:
@@ -323,7 +322,7 @@ class ClaudeCodeAdapter(AgentAdapter):
         deadline = time.monotonic() + timeout
         try:
             await asyncio.wait_for(sess.turn_done.wait(), timeout=timeout)
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             raise TimeoutError(
                 f"claude session {sess.session_id} did not finish in "
                 f"{timeout:.1f}s (deadline={deadline})"

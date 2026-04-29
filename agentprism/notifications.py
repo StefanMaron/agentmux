@@ -57,9 +57,9 @@ class MCPContextHolder:
     reuse the reference for asynchronous notifications fired later.
     """
 
-    session: "ServerSession | None" = None
+    session: ServerSession | None = None
 
-    def capture(self, session: "ServerSession") -> None:
+    def capture(self, session: ServerSession) -> None:
         """Record the active session if we haven't already."""
         if self.session is None:
             self.session = session
@@ -86,7 +86,7 @@ class MCPContextHolder:
 # ---------------------------------------------------------------------------
 
 
-def _build_message(session: "Session", output: str) -> str:
+def _build_message(session: Session, output: str) -> str:
     """Compose the human-readable wake-up text sent to the client."""
     return (
         "Subagent worker finished.\n\n"
@@ -102,7 +102,7 @@ def _build_message(session: "Session", output: str) -> str:
 
 
 async def notify_session_complete(
-    session: "Session",
+    session: Session,
     output: str,
     holder: MCPContextHolder,
 ) -> None:
@@ -138,7 +138,7 @@ async def notify_session_complete(
                 "sampling/createMessage delivered for session %s", session.session_id
             )
             return
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             # The client may reject sampling (rate limits, user denial, etc.).
             # Fall through to the log-notification fallback so something is
             # still visible.
@@ -168,7 +168,7 @@ async def notify_session_complete(
         log.info(
             "notifications/message delivered for session %s", session.session_id
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         log.warning(
             "notifications/message failed for %s: %r (payload=%s)",
             session.session_id,
