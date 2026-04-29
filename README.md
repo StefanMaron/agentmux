@@ -2,7 +2,7 @@
 
 **A universal MCP server that exposes coding agents — GitHub Copilot, Claude Code, Codex — as background subagents behind a single, unified tool interface.**
 
-agentprism lets one AI agent orchestrate other AI agents. Drop it into your MCP client (Claude Code, Cursor, Continue, …) and you gain seven tools — `agent_spawn`, `agent_send`, `agent_wait`, `agent_status`, `agent_list`, `agent_kill`, `agent_models` — that drive any supported coding agent through its native protocol. Run several in parallel, hand off tasks between them, or use a cheaper model as a worker for a more expensive planner. agentprism speaks each provider's wire protocol natively (ACP JSON-RPC for Copilot, stream-JSON for Claude Code, exec-resume for Codex) — no fragile screen-scraping.
+agentprism lets one AI agent orchestrate other AI agents. Drop it into your MCP client (Claude Code, Cursor, Continue, …) and you gain nine tools — `agent_run`, `agent_spawn`, `agent_send`, `agent_wait`, `agent_status`, `agent_list`, `agent_kill`, `agent_models`, `agent_providers` — that drive any supported coding agent through its native protocol. Run several in parallel, hand off tasks between them, or use a cheaper model as a worker for a more expensive planner. agentprism speaks each provider's wire protocol natively (ACP JSON-RPC for Copilot, stream-JSON for Claude Code, exec-resume for Codex) — no fragile screen-scraping.
 
 ## Installation
 
@@ -70,7 +70,7 @@ still works for a single per-instance dashboard if you need it.
 
 If you'd rather run via uvx, use `"command": "uvx", "args": ["agentprism"]`.
 
-Restart Claude Code. The eight `agent_*` tools will appear. Try:
+Restart Claude Code. The nine `agent_*` tools will appear. Try:
 
 > Call `agent_providers` to see what's available, then use `agent_spawn` to start a Copilot session in `/tmp/playground` with the task "write a Python script that prints prime numbers up to 100", then `agent_wait` for it to finish.
 
@@ -150,32 +150,27 @@ Use `agent_models(provider="copilot")` at runtime to get the current list. Examp
 ## Architecture
 
 ```
-┌──────────────────┐                     ┌──────────────────────────────┐
-│  MCP client      │  agent_spawn(...)   │      agentprism server         │
-│  (Claude Code,   │ ──────────────────► │                              │
-│   Cursor, ...)   │  ◄──── result ────  │  ┌────────────────────────┐  │
-└──────────────────┘                     │  │   ToolDispatcher       │  │
-                                         │  └───────────┬────────────┘  │
-                                         │              │               │
-                                         │  ┌───────────▼────────────┐  │
-                                         │  │   SessionRegistry      │  │
-                                         │  │   session_id ► Adapter │  │
-                                         │  └───────────┬────────────┘  │
-                                         │              │               │
-                                         │  ┌───────────▼────────────┐  │
-                                         │  │   CopilotAdapter (ACP) │  │
-                                         │  │   ClaudeCodeAdapter    │  │
-                                         │  │   CodexAdapter         │  │
-                                         │  └───────────┬────────────┘  │
-                                         └──────────────┼───────────────┘
-                                                        │ native protocol
-                                                        ▼
-                                          ┌─────────────────────────────┐
-                                          │  coding agent subprocess    │
-                                          └─────────────────────────────┘
+Claude session A          Claude session B          agentprism dashboard
+(project X)               (project Y)               (standalone, any terminal)
+     │                         │                              │
+     ▼                         ▼                              │
+agentprism (stdio)        agentprism (stdio)                  │
+SessionRegistry           SessionRegistry                     │
+HTTP API :auto ──────────────────────────────────────────────►│ fan-out
+     │  writes                 │  writes              reads   │
+     ▼                         ▼                      all     ▼
+~/.agentprism/{pidA}.json  ~/.agentprism/{pidB}.json ──► grouped by project
+     │                         │                         http://localhost:7070
+     ▼                         ▼
+CopilotAdapter           ClaudeCodeAdapter
+CodexAdapter             CopilotAdapter
+     │                         │
+     ▼                         ▼
+copilot --acp           claude stream-json
+(subprocess)            (subprocess)
 ```
 
-Each adapter owns one subprocess per session. A reader coroutine demuxes stdout: responses resolve pending futures, while streaming updates accumulate in an output buffer that `agent_wait` and `agent_send` drain.
+Sessions are fully isolated per Claude session — no cross-session interference. The standalone dashboard is read-only and discovers instances via `~/.agentprism/{pid}.json` lockfiles.
 
 ## Configuration
 
