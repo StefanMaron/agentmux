@@ -213,6 +213,7 @@ class AiderAdapter(AgentAdapter):
             "--no-stream",           # easier line-buffered drain
             "--no-auto-commits",     # let agentprism decide when to commit
             "--no-suggest-shell-commands",
+            "--edit-format", "diff", # SEARCH/REPLACE — works better than 'whole' with Qwen
         ]
 
     async def _run_turn(self, sess: _AiderSession, prompt: str) -> None:
