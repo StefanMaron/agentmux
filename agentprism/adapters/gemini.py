@@ -146,9 +146,9 @@ class GeminiAdapter(AgentAdapter):
             argv += ["--resume", sess.gemini_session_id]
         argv += [
             "-p", prompt,
-            "-y",                          # yolo: auto-approve all tool calls
-            "--skip-trust",                # trust cwd without interactive prompt
-            "--output-format", "json",     # JSONL events with tool calls
+            "-y",                               # yolo: auto-approve all tool calls
+            "--skip-trust",                     # trust cwd without interactive prompt
+            "--output-format", "stream-json",   # JSONL stream: message/tool/result events
         ]
         if sess.model:
             argv += ["--model", sess.model]
@@ -159,11 +159,16 @@ class GeminiAdapter(AgentAdapter):
         log.info("gemini spawn: %s (cwd=%s)", " ".join(argv[:5]) + " …", sess.cwd)
         sess.proc = await asyncio.create_subprocess_exec(
             *argv,
-            stdin=asyncio.subprocess.DEVNULL,
+            stdin=asyncio.subprocess.PIPE,     # gemini needs a pipe (not DEVNULL) to detect non-TTY
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=sess.cwd,
         )
+        # Write empty line + close — equivalent to `echo "" | gemini`
+        if sess.proc.stdin:
+            sess.proc.stdin.write(b"\n")
+            await sess.proc.stdin.drain()
+            sess.proc.stdin.close()
         sess.done_event.clear()
         sess.status = "working"
         sess.last_activity = time.time()
@@ -209,41 +214,34 @@ class GeminiAdapter(AgentAdapter):
                 if "session_id" in ev and not sess.gemini_session_id:
                     sess.gemini_session_id = ev["session_id"]
 
-                # Error
-                if "error" in ev:
-                    err = ev["error"]
-                    msg = err.get("message") or str(err)
-                    sess.all_chunks.append({"kind": "error", "text": f"error: {msg}\n"})
-                    text_parts.append(f"ERROR: {msg}")
-                    return
+                # stream-json event types
+                if ev_type == "init":
+                    model = ev.get("model", "")
+                    sess.all_chunks.append({"kind": "think", "text": f"[gemini/{model}]\n"})
 
-                # Tool call start
-                if ev_type == "tool_call_start":
-                    name = ev.get("tool_name") or ev.get("name") or "tool"
+                elif ev_type == "message":
+                    role = ev.get("role", "")
+                    content = ev.get("content") or ""
+                    if role == "assistant" and content:
+                        text_parts.append(str(content))
+                        sess.all_chunks.append({"kind": "text", "text": str(content)})
+
+                elif ev_type == "tool_call":
+                    name = ev.get("name") or ev.get("tool_name") or "tool"
                     args = ev.get("args") or ev.get("arguments") or {}
                     cmd = args.get("command") or args.get("query") or _json.dumps(args)[:80]
                     sess.all_chunks.append({"kind": "tool", "text": f"⚙ {name}({cmd})\n"})
 
-                # Tool call result
-                elif ev_type in ("tool_call_end", "tool_result"):
+                elif ev_type == "tool_result":
                     result = ev.get("result") or ev.get("output") or ev.get("content") or ""
                     if result:
                         preview = str(result)[:300].replace("\n", " ")
                         sess.all_chunks.append({"kind": "tool", "text": f"  → {preview}\n"})
 
-                # Assistant text content
-                elif ev_type in ("model_turn", "content", "assistant"):
-                    content = ev.get("content") or ev.get("text") or ""
-                    if content:
-                        text_parts.append(str(content))
-                        sess.all_chunks.append({"kind": "text", "text": str(content)})
-
-                # Catch-all: surface any text field
-                elif "content" in ev or "text" in ev:
-                    text = ev.get("content") or ev.get("text") or ""
-                    if text and ev_type not in ("session_start", "session_end"):
-                        text_parts.append(str(text))
-                        sess.all_chunks.append({"kind": "text", "text": str(text)})
+                elif ev_type == "error":
+                    msg = ev.get("message") or ev.get("error") or str(ev)
+                    sess.all_chunks.append({"kind": "error", "text": f"error: {msg}\n"})
+                    text_parts.append(f"ERROR: {msg}")
 
         await asyncio.gather(read_stdout_jsonl(), read_stderr())
         await sess.proc.wait()
