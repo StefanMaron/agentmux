@@ -1,35 +1,19 @@
-"""GitHub Copilot CLI adapter.
+"""GitHub Copilot CLI adapter — subprocess-based (no ACP).
 
-Speaks the Agent Client Protocol (ACP) — JSON-RPC 2.0 over stdio — with
-a ``copilot --acp`` subprocess. Each adapter instance owns exactly one
-subprocess and one ACP session.
-
-Lifecycle
----------
-
-1. ``spawn(task, cwd, ...)``
-   * launches ``copilot --acp``
-   * sends ``initialize``
-   * sends ``session/new`` with ``cwd``
-   * (optional) sends ``session/set_mode``
-   * sends ``session/prompt`` with the initial task — does **not** wait
-   * returns the ACP session id
-
-2. A background reader coroutine demuxes stdout:
-   * frames with an ``id`` resolve the matching ``Future`` in ``_pending``
-   * notifications (no ``id``) named ``session/update`` append text chunks
-     to ``_output_buffer`` and flip ``_done`` when ``stopReason`` arrives
-
-3. ``send`` / ``wait`` / ``status`` / ``kill`` operate on this state.
+Uses ``copilot -p <task> --yolo`` per turn, with ``--resume`` for follow-ups.
+Much simpler than ACP and actually works.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
-from typing import Any
+import pathlib
+import tempfile
+import time
+import uuid
+from dataclasses import dataclass, field
 
 from agentprism.adapters.base import AgentAdapter, ProviderStatus
 
@@ -37,8 +21,6 @@ log = logging.getLogger(__name__)
 
 COPILOT_BINARY = os.environ.get("AGENTPRISM_COPILOT_BIN", "copilot")
 
-# Live-probed model catalogue. Multipliers are quoted strings to preserve
-# the human-readable "0x" / "7.5x" form Copilot uses.
 COPILOT_MODELS: list[dict[str, str]] = [
     {"id": "auto",              "multiplier": "1x",    "note": "default (resolves to claude-sonnet-4.6)"},
     {"id": "claude-sonnet-4.6", "multiplier": "1x",    "note": "best default for most tasks"},
@@ -56,55 +38,31 @@ COPILOT_MODELS: list[dict[str, str]] = [
     {"id": "gpt-4.1",           "multiplier": "0x",    "note": "free"},
 ]
 
-ACP_MODE_URI = "https://agentclientprotocol.com/protocol/session-modes"
-KNOWN_MODES = {"agent", "plan", "autopilot"}
 
-
-def _mode_uri(mode: str) -> str:
-    """Expand a short mode name (``"plan"``) to the full ACP URI."""
-    if mode.startswith("http"):
-        return mode
-    short = mode.lstrip("#")
-    if short not in KNOWN_MODES:
-        raise ValueError(f"Unknown Copilot mode '{mode}'. Expected one of {sorted(KNOWN_MODES)}.")
-    return f"{ACP_MODE_URI}#{short}"
+@dataclass
+class _CopilotSession:
+    session_id: str
+    session_name: str        # passed to --name / --resume
+    cwd: str
+    model: str | None
+    output_file: str         # --share target
+    proc: asyncio.subprocess.Process | None = None
+    output: str = ""
+    status: str = "working"  # working | idle | done | error
+    done_event: asyncio.Event = field(default_factory=asyncio.Event)
+    spawn_time: float = field(default_factory=time.time)
+    last_activity: float = field(default_factory=time.time)
+    all_chunks: list[dict] = field(default_factory=list)
 
 
 class CopilotAdapter(AgentAdapter):
-    """Adapter for the ``copilot --acp`` JSON-RPC stdio agent."""
+    """Copilot adapter using ``copilot -p … --yolo`` subprocess per turn."""
 
     provider = "copilot"
 
     def __init__(self) -> None:
-        self._proc: asyncio.subprocess.Process | None = None
-        self._reader_task: asyncio.Task | None = None
-        self._stderr_task: asyncio.Task | None = None
-
-        # JSON-RPC plumbing.
-        self._next_id = 1
-        self._pending: dict[int, asyncio.Future[Any]] = {}
-        self._write_lock = asyncio.Lock()
-
-        # Session state.
-        self._acp_session_id: str | None = None
-        self._output_buffer: list[str] = []
-        # Persistent stream for the dashboard — never drained, accumulates all
-        # visible events (agent text, tool calls, shell output, etc.).
-        self._all_chunks: list[dict] = []
-        self._done = asyncio.Event()
-        self._done.set()  # idle by default; cleared when a prompt is in flight
-        self._current_prompt_id: int | None = None
-        self._last_stop_reason: str | None = None
-        self._error: str | None = None
-
-        # Observability — tracked independently of ACP notification content.
-        import time
-        self._spawn_time: float = time.time()
-        self._last_frame_at: float = time.time()
-        self._frame_count: int = 0
-        self._log_file: str | None = None  # populated after spawn
-
-    # ------------------------------------------------------------------ public
+        self._session: _CopilotSession | None = None
+        self._drain_task: asyncio.Task | None = None
 
     @classmethod
     def models(cls) -> list[dict]:
@@ -112,15 +70,15 @@ class CopilotAdapter(AgentAdapter):
 
     @classmethod
     def check_available(cls) -> ProviderStatus:
-        import pathlib
         installed = cls._binary_installed(COPILOT_BINARY)
         if not installed:
             return ProviderStatus("copilot", False, False, f"'{COPILOT_BINARY}' not found in PATH")
-        # Auth: copilot stores session in ~/.copilot/
         auth_dir = pathlib.Path.home() / ".copilot"
         authenticated = auth_dir.is_dir() and any(auth_dir.iterdir())
         note = "" if authenticated else "run 'copilot login' to authenticate"
         return ProviderStatus("copilot", True, authenticated, note)
+
+    # ------------------------------------------------------------------ public
 
     async def spawn(
         self,
@@ -129,442 +87,149 @@ class CopilotAdapter(AgentAdapter):
         model: str | None = None,
         mode: str | None = None,
     ) -> str:
-        if self._proc is not None:
-            raise RuntimeError("CopilotAdapter already spawned; create a new instance per session.")
+        session_id = str(uuid.uuid4())
+        session_name = f"agentprism-{session_id[:8]}"
+        output_file = tempfile.mktemp(prefix="agentprism-", suffix=".md")
 
-        if not os.path.isabs(cwd):
-            raise ValueError(f"cwd must be an absolute path, got: {cwd!r}")
-        if not os.path.isdir(cwd):
-            raise ValueError(f"cwd does not exist or is not a directory: {cwd}")
-
-        argv = [COPILOT_BINARY, "--acp"]
-        if model:
-            argv.extend(["--model", model])
-
-        log.info("Spawning copilot: %s (cwd=%s)", " ".join(argv), cwd)
-        self._proc = await asyncio.create_subprocess_exec(
-            *argv,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        sess = _CopilotSession(
+            session_id=session_id,
+            session_name=session_name,
             cwd=cwd,
+            model=model,
+            output_file=output_file,
         )
+        self._session = sess
 
-        self._reader_task = asyncio.create_task(self._read_stdout(), name="copilot-stdout")
-        self._stderr_task = asyncio.create_task(self._read_stderr(), name="copilot-stderr")
-
-        # Find the copilot log file created for this process (used for activity tracking).
-        import glob
-        import pathlib as _pathlib
-        import time as _time
-        _time.sleep(0.3)  # let copilot create its log file
-        logs = sorted(glob.glob(str(_pathlib.Path.home() / ".copilot" / "logs" / "*.log")),
-                      key=lambda p: os.path.getmtime(p), reverse=True)
-        if logs:
-            self._log_file = logs[0]
-
-        # 1. initialize
-        await self._request(
-            "initialize",
-            {
-                "protocolVersion": 1,
-                "capabilities": {},
-                "clientInfo": {"name": "agentprism", "version": "0.1.0"},
-            },
-        )
-
-        # 2. session/new
-        new_resp = await self._request("session/new", {"cwd": cwd, "mcpServers": []})
-        session_id = new_resp.get("sessionId")
-        if not session_id:
-            raise RuntimeError(f"copilot session/new returned no sessionId: {new_resp!r}")
-        self._acp_session_id = session_id
-
-        # 3a. set model via ACP config (CLI --model flag is overridden by settings.json)
-        if model:
-            try:
-                await self._request(
-                    "session/set_config",
-                    {"sessionId": session_id, "configId": "model", "value": model},
-                )
-                log.info("Set copilot model to %r via session/set_config", model)
-            except Exception:
-                log.warning("session/set_config failed — model may not be honoured; CLI flag was: %r", model)
-
-        # 3b. optional set_mode
-        if mode:
-            await self._request(
-                "session/set_mode",
-                {"sessionId": session_id, "mode": _mode_uri(mode)},
-            )
-
-        # 4. fire the initial prompt — do NOT await its completion
-        self._start_prompt(task)
-
+        await self._run_turn(sess, task, is_first=True)
         return session_id
 
     async def send(self, session_id: str, message: str) -> str:
-        self._check_session(session_id)
-        # Wait for any in-flight turn to finish before starting a new one.
-        await self._done.wait()
-        prompt_id = self._start_prompt(message)
-        await self._await_prompt(prompt_id)
-        return self._drain_output()
+        sess = self._require(session_id)
+        await sess.done_event.wait()
+        sess.done_event.clear()
+        sess.status = "working"
+        await self._run_turn(sess, message, is_first=False)
+        await sess.done_event.wait()
+        return sess.output
 
     async def status(self, session_id: str) -> str:
-        self._check_session(session_id)
-        if self._error:
-            return "error"
-        if self._proc is None or self._proc.returncode is not None:
-            return "done"
-        if not self._done.is_set():
-            return "working"
-        return "idle"
-
-    def activity_info(self) -> dict:
-        """Return observability metadata independent of ACP notification content."""
-        import time
-        now = time.time()
-        info: dict = {
-            "acp_frames_received": self._frame_count,
-            "last_acp_frame_seconds_ago": round(now - self._last_frame_at, 1),
-            "uptime_seconds": round(now - self._spawn_time),
-            "process_alive": self._proc is not None and self._proc.returncode is None,
-        }
-        # Read recent activity from copilot's log file
-        recent_tools: list[str] = []
-        if self._log_file:
-            try:
-                with open(self._log_file, encoding="utf-8", errors="replace") as f:
-                    lines = f.readlines()
-                for line in lines[-200:]:
-                    if "[INFO] System notification:" in line or \
-                       "Tool invoked" in line or \
-                       "tool invoked" in line or \
-                       "Persisted checkpoint" in line:
-                        # Extract just the relevant part
-                        msg = line.strip().split("] ", 1)[-1] if "] " in line else line.strip()
-                        recent_tools.append(msg[:120])
-                info["recent_log_activity"] = recent_tools[-5:]  # last 5 entries
-            except Exception:
-                pass
-        return info
+        sess = self._require(session_id)
+        return sess.status
 
     async def wait(self, session_id: str, timeout: float | None = None) -> str:
-        self._check_session(session_id)
-        if self._current_prompt_id is None:
-            return self._drain_output()
+        sess = self._require(session_id)
         try:
-            await asyncio.wait_for(self._done.wait(), timeout=timeout)
+            await asyncio.wait_for(sess.done_event.wait(), timeout=timeout)
         except TimeoutError as e:
-            raise TimeoutError(
-                f"Timed out after {timeout}s waiting for copilot session {session_id}"
-            ) from e
-        return self._drain_output()
+            raise TimeoutError(f"Timed out after {timeout}s") from e
+        return sess.output
 
     async def kill(self, session_id: str) -> None:
-        if self._acp_session_id and session_id != self._acp_session_id:
-            raise ValueError(f"Unknown session_id {session_id}")
-
-        # Best-effort graceful close.
-        if self._proc and self._proc.returncode is None and self._acp_session_id:
+        sess = self._require(session_id)
+        if sess.proc and sess.proc.returncode is None:
             try:
-                await asyncio.wait_for(
-                    self._request("session/close", {"sessionId": self._acp_session_id}),
-                    timeout=2.0,
-                )
-            except (TimeoutError, Exception) as e:
-                log.debug("session/close failed (ignored): %s", e)
-
-        if self._proc and self._proc.returncode is None:
-            try:
-                self._proc.terminate()
+                sess.proc.terminate()
+                await asyncio.wait_for(sess.proc.wait(), timeout=3.0)
+            except Exception:
                 try:
-                    await asyncio.wait_for(self._proc.wait(), timeout=3.0)
-                except TimeoutError:
-                    self._proc.kill()
-                    await self._proc.wait()
-            except ProcessLookupError:
-                pass
-
-        for task in (self._reader_task, self._stderr_task):
-            if task and not task.done():
-                task.cancel()
-                try:
-                    await task
-                except (asyncio.CancelledError, Exception):
+                    sess.proc.kill()
+                except Exception:
                     pass
-
-        # Fail any still-pending futures.
-        for fut in self._pending.values():
-            if not fut.done():
-                fut.set_exception(RuntimeError("copilot subprocess terminated"))
-        self._pending.clear()
-        self._done.set()
-
-    # ----------------------------------------------------------------- internals
-
-    def _check_session(self, session_id: str) -> None:
-        if self._acp_session_id is None:
-            raise RuntimeError("CopilotAdapter has not been spawned yet")
-        if session_id != self._acp_session_id:
-            raise ValueError(
-                f"session_id mismatch: adapter owns {self._acp_session_id!r}, got {session_id!r}"
-            )
-
-    def _start_prompt(self, text: str) -> int:
-        """Send a ``session/prompt`` and register its future without awaiting."""
-        assert self._acp_session_id is not None
-        self._output_buffer.clear()
-        self._last_stop_reason = None
-        self._done.clear()
-
-        prompt_id = self._next_id
-        self._next_id += 1
-        self._current_prompt_id = prompt_id
-
-        fut: asyncio.Future[Any] = asyncio.get_event_loop().create_future()
-        self._pending[prompt_id] = fut
-
-        params = {
-            "sessionId": self._acp_session_id,
-            "prompt": [{"type": "text", "text": text}],
-        }
-        asyncio.create_task(  # noqa: RUF006
-            self._send_frame(
-                {"jsonrpc": "2.0", "id": prompt_id, "method": "session/prompt", "params": params}
-            )
-        )
-        return prompt_id
-
-    async def _await_prompt(self, prompt_id: int) -> Any:
-        fut = self._pending.get(prompt_id)
-        if fut is None:
-            raise RuntimeError(f"No pending future for prompt id {prompt_id}")
+        if self._drain_task and not self._drain_task.done():
+            self._drain_task.cancel()
         try:
-            return await fut
-        finally:
-            self._done.set()
-
-    async def _request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
-        """Send a JSON-RPC request and await its response."""
-        if self._proc is None:
-            raise RuntimeError("subprocess not started")
-        req_id = self._next_id
-        self._next_id += 1
-        fut: asyncio.Future[Any] = asyncio.get_event_loop().create_future()
-        self._pending[req_id] = fut
-        await self._send_frame(
-            {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params}
-        )
-        return await fut
-
-    async def _send_frame(self, frame: dict[str, Any]) -> None:
-        if self._proc is None or self._proc.stdin is None:
-            raise RuntimeError("copilot stdin not available")
-        data = (json.dumps(frame) + "\n").encode("utf-8")
-        async with self._write_lock:
-            self._proc.stdin.write(data)
-            await self._proc.stdin.drain()
-        log.debug("→ copilot %s", frame.get("method") or f"response#{frame.get('id')}")
-
-    async def _read_stdout(self) -> None:
-        assert self._proc is not None and self._proc.stdout is not None
-        try:
-            while True:
-                line = await self._proc.stdout.readline()
-                if not line:
-                    break
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    frame = json.loads(line)
-                except json.JSONDecodeError:
-                    log.warning("copilot non-JSON stdout line: %r", line[:200])
-                    continue
-                import time
-                self._last_frame_at = time.time()
-                self._frame_count += 1
-                self._dispatch(frame)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            log.exception("copilot reader crashed: %s", e)
-            self._error = str(e)
-        finally:
-            # Reader exited — fail any pending futures so callers don't hang.
-            for fut in self._pending.values():
-                if not fut.done():
-                    fut.set_exception(RuntimeError("copilot stdout closed"))
-            self._pending.clear()
-            self._done.set()
-
-    async def _read_stderr(self) -> None:
-        assert self._proc is not None and self._proc.stderr is not None
-        try:
-            while True:
-                line = await self._proc.stderr.readline()
-                if not line:
-                    break
-                log.debug("copilot stderr: %s", line.decode("utf-8", errors="replace").rstrip())
-        except asyncio.CancelledError:
-            raise
+            pathlib.Path(sess.output_file).unlink(missing_ok=True)
         except Exception:
             pass
+        sess.status = "done"
+        sess.done_event.set()
 
-    def _dispatch(self, frame: dict[str, Any]) -> None:
-        """Route a single JSON-RPC frame to the right handler."""
-        if "id" in frame and ("result" in frame or "error" in frame):
-            # Response to one of our requests.
-            req_id = frame["id"]
-            fut = self._pending.pop(req_id, None)
-            if fut is None or fut.done():
-                log.debug("copilot response with no waiter: id=%s", req_id)
-                return
-            if "error" in frame:
-                err = frame["error"]
-                fut.set_exception(
-                    RuntimeError(f"copilot error {err.get('code')}: {err.get('message')}")
-                )
-            else:
-                result = frame.get("result") or {}
-                if req_id == self._current_prompt_id:
-                    self._last_stop_reason = result.get("stopReason")
-                    self._current_prompt_id = None
-                fut.set_result(result)
-            return
+    def activity_info(self) -> dict:
+        sess = self._session
+        if sess is None:
+            return {}
+        return {
+            "process_alive": sess.proc is not None and sess.proc.returncode is None,
+            "uptime_seconds": round(time.time() - sess.spawn_time),
+            "last_activity_seconds_ago": round(time.time() - sess.last_activity, 1),
+            "status": sess.status,
+        }
 
-        # Inbound request from Copilot (has id + method — Copilot wants US to do something).
-        # Must respond or Copilot hangs forever waiting.
-        if "id" in frame and "method" in frame:
-            req_id = frame["id"]
-            method = frame.get("method", "")
-            params = frame.get("params") or {}
-            log.debug("copilot inbound request: method=%s id=%s", method, req_id)
-            asyncio.create_task(  # noqa: RUF006
-                self._handle_inbound_request(req_id, method, params)
-            )
-            return
+    # ---------------------------------------------------------------- private
 
-        # Notification (no id).
-        method = frame.get("method")
-        params = frame.get("params") or {}
-        if method == "session/update":
-            self._handle_session_update(params)
+    def _require(self, session_id: str) -> _CopilotSession:
+        if self._session is None or self._session.session_id != session_id:
+            raise ValueError(f"Unknown session_id: {session_id}")
+        return self._session
+
+    def _build_argv(self, sess: _CopilotSession, prompt: str, is_first: bool) -> list[str]:
+        argv = [COPILOT_BINARY]
+        if not is_first:
+            argv += ["--resume", sess.session_name]
         else:
-            log.debug("copilot unhandled notification: %s", method)
+            argv += ["--name", sess.session_name]
+        argv += [
+            "-p", prompt,
+            "--yolo",
+            "--share", sess.output_file,
+            "-s",  # silent: agent response only, no stats
+        ]
+        if sess.model:
+            argv += ["--model", sess.model]
+        return argv
 
-    async def _handle_inbound_request(
-        self, req_id: Any, method: str, params: dict[str, Any]
-    ) -> None:
-        """Respond to requests Copilot sends to the ACP client.
+    async def _run_turn(self, sess: _CopilotSession, prompt: str, is_first: bool) -> None:
+        argv = self._build_argv(sess, prompt, is_first)
+        log.info("copilot spawn: %s (cwd=%s)", " ".join(argv[:6]) + " …", sess.cwd)
 
-        If we don't respond, Copilot stalls waiting for our reply forever.
-        We handle the critical ones and send a graceful error for the rest
-        so Copilot can fall back to its own built-in tool execution.
-        """
-        if method == "session/request_permission":
-            # Copilot is asking whether it may use a tool.
-            # Always grant — equivalent to --yolo.
-            # Copilot expects {"outcome": "grant"} — not {"granted": True}.
-            await self._send_response(req_id, {"outcome": "grant"})
-
-        elif method in ("fs/read_text_file",):
-            # Copilot wants us to read a file on its behalf.
-            path = params.get("path") or params.get("uri") or ""
-            try:
-                with open(path, encoding="utf-8", errors="replace") as fh:
-                    content = fh.read()
-                await self._send_response(req_id, {"content": content})
-            except OSError as e:
-                await self._send_error(req_id, -32000, f"fs/read_text_file failed: {e}")
-
-        elif method in ("fs/write_text_file",):
-            path = params.get("path") or params.get("uri") or ""
-            content = params.get("content") or ""
-            try:
-                with open(path, "w", encoding="utf-8") as fh:
-                    fh.write(content)
-                await self._send_response(req_id, {"ok": True})
-            except OSError as e:
-                await self._send_error(req_id, -32000, f"fs/write_text_file failed: {e}")
-
-        else:
-            # Unknown request — send method-not-found so Copilot doesn't hang.
-            # Copilot will fall back to its own built-in shell/tool execution.
-            log.debug("copilot inbound request not implemented: %s", method)
-            await self._send_error(req_id, -32601, f"Method not implemented by agentprism client: {method}")
-
-    async def _send_response(self, req_id: Any, result: dict) -> None:
-        await self._send_frame({"jsonrpc": "2.0", "id": req_id, "result": result})
-
-    async def _send_error(self, req_id: Any, code: int, message: str) -> None:
-        await self._send_frame(
-            {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
+        sess.proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=sess.cwd,
+        )
+        sess.done_event.clear()
+        sess.status = "working"
+        sess.last_activity = time.time()
+        self._drain_task = asyncio.create_task(
+            self._drain(sess), name=f"copilot-drain-{sess.session_id[:8]}"
         )
 
-    def _handle_session_update(self, params: dict[str, Any]) -> None:
-        update = params.get("update") or {}
-        kind = update.get("sessionUpdate")
-        content = update.get("content") or {}
+    async def _drain(self, sess: _CopilotSession) -> None:
+        """Read stdout/stderr, update chunks, mark done on exit."""
+        assert sess.proc is not None
+        stdout_chunks: list[bytes] = []
+        stderr_chunks: list[bytes] = []
 
-        if kind == "agent_message_chunk":
-            if content.get("type") == "text":
-                text = content.get("text") or ""
-                if text:
-                    self._output_buffer.append(text)
-                    self._all_chunks.append({"kind": "text", "text": text})
+        async def read_stream(stream: asyncio.StreamReader, buf: list[bytes], kind: str) -> None:
+            while True:
+                line = await stream.readline()
+                if not line:
+                    break
+                buf.append(line)
+                sess.last_activity = time.time()
+                text = line.decode("utf-8", errors="replace")
+                sess.all_chunks.append({"kind": kind, "text": text})
 
-        elif kind == "agent_thought_chunk":
-            if content.get("type") == "text":
-                text = content.get("text") or ""
-                if text:
-                    self._all_chunks.append({"kind": "think", "text": text})
+        await asyncio.gather(
+            read_stream(sess.proc.stdout, stdout_chunks, "text"),
+            read_stream(sess.proc.stderr, stderr_chunks, "tool"),
+        )
+        await sess.proc.wait()
 
-        elif kind in ("tool_call_chunk", "tool_call"):
-            name = content.get("name") or update.get("name") or ""
-            args = content.get("arguments") or content.get("input") or ""
-            if isinstance(args, dict):
-                import json as _json
-                args = _json.dumps(args, separators=(",", ":"))
-            label = f"⚙ {name}({str(args)[:120]})\n" if name else ""
-            if label:
-                self._all_chunks.append({"kind": "tool", "text": label})
+        # Prefer the --share file (full markdown output) over stdout
+        share = pathlib.Path(sess.output_file)
+        if share.exists() and share.stat().st_size > 0:
+            sess.output = share.read_text(encoding="utf-8", errors="replace")
+        else:
+            sess.output = b"".join(stdout_chunks).decode("utf-8", errors="replace")
 
-        elif kind == "tool_call_update":
-            # Copilot's actual tool call notification kind
-            status = update.get("status", "")
-            tool_id = update.get("toolCallId", "")
-            tool_name = update.get("toolName") or update.get("name") or tool_id[:12] or "tool"
-            raw_out = update.get("rawOutput") or {}
-            out_text = ""
-            if isinstance(raw_out, dict):
-                out_text = raw_out.get("content") or raw_out.get("text") or raw_out.get("output") or ""
-            elif isinstance(raw_out, str):
-                out_text = raw_out
-            if status == "started":
-                self._all_chunks.append({"kind": "tool", "text": f"⚙ {tool_name} …\n"})
-            elif out_text:
-                preview = str(out_text)[:200].replace("\n", " ")
-                self._all_chunks.append({"kind": "tool", "text": f"  → {preview}\n"})
+        if sess.proc.returncode != 0 and not sess.output.strip():
+            err = b"".join(stderr_chunks).decode("utf-8", errors="replace")
+            sess.status = "error"
+            sess.output = err or f"copilot exited with code {sess.proc.returncode}"
+        else:
+            sess.status = "done"
 
-        elif kind == "tool_result_chunk":
-            result = content.get("text") or content.get("output") or ""
-            if result:
-                self._all_chunks.append({"kind": "tool", "text": f"  → {str(result)[:300]}\n"})
-
-        elif kind is not None:
-            # Unknown kind — log the raw update so we can learn what Copilot sends
-            # and surface something to the dashboard rather than silently dropping
-            log.debug("copilot unknown sessionUpdate kind=%r update=%r", kind, update)
-            # Show anything with visible text
-            text = (content.get("text") or content.get("output") or
-                    update.get("text") or str(update)[:200])
-            if text and kind not in ("available_commands_update", "user_message_chunk"):
-                self._all_chunks.append({"kind": "tool", "text": f"[{kind}] {str(text)[:300]}\n"})
-
-    def _drain_output(self) -> str:
-        text = "".join(self._output_buffer)
-        self._output_buffer.clear()
-        return text
+        sess.done_event.set()
+        log.info("copilot turn done (rc=%s, output=%d chars)", sess.proc.returncode, len(sess.output))
