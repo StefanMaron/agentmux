@@ -16,6 +16,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
+from agentprism.dashboard import start_dashboard
 from agentprism.notifications import MCPContextHolder, notify_session_complete
 from agentprism.session import Session, SessionRegistry
 from agentprism.tools import ToolDispatcher, tool_definitions
@@ -87,10 +88,12 @@ def build_server() -> tuple[Server, SessionRegistry, MCPContextHolder]:
     return server, registry, holder
 
 
-async def run() -> None:
+async def run(dashboard_port: int | None = None) -> None:
     _configure_logging()
     server, registry, holder = build_server()
     log.info("agentprism starting (pid=%d)", os.getpid())
+    if dashboard_port is not None:
+        await start_dashboard(dashboard_port, registry)
     try:
         async with stdio_server() as (read_stream, write_stream):
             await server.run(
@@ -106,8 +109,13 @@ async def run() -> None:
 
 def main() -> None:
     """Console-script entrypoint."""
+    import argparse
+    parser = argparse.ArgumentParser(prog="agentprism", add_help=False)
+    parser.add_argument("--dashboard", metavar="PORT", type=int, default=None,
+                        help="Start HTTP session dashboard on this port (e.g. 7070)")
+    args, _ = parser.parse_known_args()
     try:
-        asyncio.run(run())
+        asyncio.run(run(dashboard_port=args.dashboard))
     except KeyboardInterrupt:
         pass
 
