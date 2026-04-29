@@ -419,13 +419,19 @@ async def _handle(
             pass
 
 
-async def start_dashboard(port: int, registry: SessionRegistry) -> None:
-    """Start the dashboard HTTP server on the given port (non-blocking)."""
+async def start_dashboard(port: int, registry: SessionRegistry) -> int:
+    """Start the dashboard HTTP server (non-blocking).
+
+    Pass ``port=0`` to let the OS pick a free port. Returns the actual bound
+    port so callers can advertise it (e.g. via a lockfile).
+    """
     server = await asyncio.start_server(
         lambda r, w: _handle(r, w, registry),
         host="127.0.0.1",
         port=port,
     )
     addr = server.sockets[0].getsockname()
-    log.info("Dashboard running at http://%s:%d", addr[0], addr[1])
+    bound_port = int(addr[1])
+    log.info("Dashboard running at http://%s:%d", addr[0], bound_port)
     asyncio.create_task(server.serve_forever())  # noqa: RUF006
+    return bound_port

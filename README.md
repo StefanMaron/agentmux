@@ -48,15 +48,27 @@ Add to `~/.claude/mcp.json` (create if it doesn't exist):
 {
   "mcpServers": {
     "agentprism": {
-      "command": "uvx",
-      "args": ["agentprism"],
+      "command": "agentprism",
       "type": "stdio"
     }
   }
 }
 ```
 
-If you installed agentprism permanently, use `"command": "agentprism"` with no `args`.
+No flags needed — every running agentprism instance auto-starts an HTTP API
+on a random free port and registers itself in `~/.agentprism/{pid}.json`. The
+global dashboard discovers and aggregates all running instances:
+
+```bash
+agentprism dashboard           # default port 7070
+agentprism dashboard --port 8080
+```
+
+Then open `http://localhost:7070` to see every active session across every
+project, grouped by working directory. The legacy `--dashboard PORT` flag
+still works for a single per-instance dashboard if you need it.
+
+If you'd rather run via uvx, use `"command": "uvx", "args": ["agentprism"]`.
 
 Restart Claude Code. The eight `agent_*` tools will appear. Try:
 

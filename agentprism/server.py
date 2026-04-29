@@ -17,6 +17,7 @@ from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
 from agentprism.dashboard import start_dashboard
+from agentprism.lockfile import remove_lock, write_lock
 from agentprism.notifications import MCPContextHolder, notify_session_complete
 from agentprism.session import Session, SessionRegistry
 from agentprism.tools import ToolDispatcher, tool_definitions
@@ -89,11 +90,32 @@ def build_server() -> tuple[Server, SessionRegistry, MCPContextHolder]:
 
 
 async def run(dashboard_port: int | None = None) -> None:
+    """Run the MCP stdio server.
+
+    Always starts an HTTP API server on a random free port and registers a
+    lockfile in ``~/.agentprism/{pid}.json`` so the standalone dashboard can
+    discover this instance. If ``dashboard_port`` is explicitly given, an
+    additional HTTP server is bound to that port for backwards compatibility
+    with the legacy per-instance dashboard.
+    """
     _configure_logging()
     server, registry, holder = build_server()
     log.info("agentprism starting (pid=%d)", os.getpid())
-    if dashboard_port is not None:
+
+    # Always start the auto-API on a random free port so the global
+    # standalone dashboard can discover and aggregate this instance.
+    api_port = await start_dashboard(0, registry)
+    cwd = os.getcwd()
+    try:
+        write_lock(api_port, cwd)
+        log.info("registered instance: port=%d cwd=%s", api_port, cwd)
+    except Exception as e:  # pragma: no cover — best effort
+        log.warning("failed to write lockfile: %s", e)
+
+    # Backwards-compat: explicit per-instance dashboard on a fixed port.
+    if dashboard_port is not None and dashboard_port != api_port:
         await start_dashboard(dashboard_port, registry)
+
     try:
         async with stdio_server() as (read_stream, write_stream):
             await server.run(
@@ -105,17 +127,57 @@ async def run(dashboard_port: int | None = None) -> None:
         log.info("agentprism shutting down — killing %d sessions", len(registry.list()))
         await registry.shutdown()
         holder.clear()
+        remove_lock()
+
+
+async def _run_standalone_dashboard(port: int) -> None:
+    """Run the standalone aggregator dashboard until interrupted."""
+    _configure_logging()
+    # Imported here so the MCP path doesn't pay the cost.
+    from agentprism.standalone_dashboard import start_standalone_dashboard
+
+    bound = await start_standalone_dashboard(port)
+    log.info("standalone dashboard listening on http://127.0.0.1:%d", bound)
+    # Block forever (until cancelled).
+    stop = asyncio.Event()
+    try:
+        await stop.wait()
+    except asyncio.CancelledError:
+        pass
 
 
 def main() -> None:
     """Console-script entrypoint."""
     import argparse
-    parser = argparse.ArgumentParser(prog="agentprism", add_help=False)
-    parser.add_argument("--dashboard", metavar="PORT", type=int, default=None,
-                        help="Start HTTP session dashboard on this port (e.g. 7070)")
+
+    parser = argparse.ArgumentParser(prog="agentprism", add_help=True)
+    parser.add_argument(
+        "--dashboard",
+        metavar="PORT",
+        type=int,
+        default=None,
+        help="(legacy) start an extra per-instance dashboard on this port",
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    dash = sub.add_parser(
+        "dashboard",
+        help="run the standalone global dashboard that aggregates all running agentprism instances",
+    )
+    dash.add_argument(
+        "--port",
+        type=int,
+        default=7070,
+        help="port to bind (default: 7070)",
+    )
+
     args, _ = parser.parse_known_args()
+
     try:
-        asyncio.run(run(dashboard_port=args.dashboard))
+        if args.command == "dashboard":
+            asyncio.run(_run_standalone_dashboard(args.port))
+        else:
+            asyncio.run(run(dashboard_port=args.dashboard))
     except KeyboardInterrupt:
         pass
 
