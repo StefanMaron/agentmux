@@ -7,13 +7,15 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from agentmux.adapters.base import AgentAdapter
+from agentmux.adapters.claude_code import ClaudeCodeAdapter
+from agentmux.adapters.codex import CodexAdapter
 from agentmux.adapters.copilot import CopilotAdapter
 
 # Provider name → adapter class.
 PROVIDERS: dict[str, type[AgentAdapter]] = {
     "copilot": CopilotAdapter,
-    # "claude-code": ClaudeCodeAdapter,   # 🔜
-    # "codex":       CodexAdapter,        # 🔜
+    "claude": ClaudeCodeAdapter,
+    "codex": CodexAdapter,
 }
 
 
