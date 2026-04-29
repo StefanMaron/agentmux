@@ -8,6 +8,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
+from agentprism.adapters.aider_adapter import AiderAdapter
 from agentprism.adapters.base import AgentAdapter
 from agentprism.adapters.claude_code import ClaudeCodeAdapter
 from agentprism.adapters.codex import CodexAdapter
@@ -28,6 +29,7 @@ PROVIDERS: dict[str, type[AgentAdapter]] = {
     "codex": CodexAdapter,
     "gemini": GeminiAdapter,
     "ollama": OllamaAdapter,
+    "aider": AiderAdapter,
 }
 
 
