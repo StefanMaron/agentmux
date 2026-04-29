@@ -184,6 +184,7 @@ class CopilotAdapter(AgentAdapter):
 
         sess.proc = await asyncio.create_subprocess_exec(
             *argv,
+            stdin=asyncio.subprocess.DEVNULL,   # must not touch parent stdio (MCP channel)
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=sess.cwd,
