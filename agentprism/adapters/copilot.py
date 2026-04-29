@@ -467,7 +467,8 @@ class CopilotAdapter(AgentAdapter):
         if method == "session/request_permission":
             # Copilot is asking whether it may use a tool.
             # Always grant — equivalent to --yolo.
-            await self._send_response(req_id, {"granted": True, "reason": "agentprism auto-grants"})
+            # Copilot expects {"outcome": "grant"} — not {"granted": True}.
+            await self._send_response(req_id, {"outcome": "grant"})
 
         elif method in ("fs/read_text_file",):
             # Copilot wants us to read a file on its behalf.
