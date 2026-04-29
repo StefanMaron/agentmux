@@ -66,6 +66,30 @@ Restart Claude Code. The eight `agent_*` tools will appear. Try:
 
 Any MCP client that supports stdio servers works. The config shape is the same — point `command` at `agentprism` (or `uvx` + `args: ["agentprism"]`).
 
+## Helping your agent know when to delegate
+
+agentprism's tool descriptions include trigger conditions, but for reliable delegation add a short snippet to your project's `AGENTS.md` or `CLAUDE.md`:
+
+```markdown
+## Delegation with agentprism
+
+You have access to the agentprism MCP server. Use it to delegate coding tasks
+to external agents (Copilot, Claude Code, Codex) instead of doing the work yourself.
+
+Trigger conditions — reach for agentprism when:
+- The user says "let Copilot handle", "delegate to Copilot", "offload to an agent", or similar
+- A task is large/mechanical and offloading would preserve your context window
+- You want to run multiple tasks in parallel
+
+Quick patterns:
+- One-shot (no corrections): `agent_run(task, cwd)`
+- Parallel workers: multiple `agent_spawn` calls, then `agent_wait` each
+- With corrections: `agent_spawn` → `agent_wait` → `agent_send` → `agent_wait` → `agent_kill`
+
+Default provider is Copilot (1x cost). Use `agent_providers` to check what's available.
+```
+
+
 ## Tool reference
 
 | Tool               | Args                                              | Returns                                    |

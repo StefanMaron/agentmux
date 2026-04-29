@@ -68,14 +68,16 @@ def tool_definitions() -> list[dict[str, Any]]:
         {
             "name": "agent_spawn",
             "description": (
-                "Spawn a coding agent in the background with an initial task. "
-                "Returns immediately with a session_id; the agent keeps working. "
-                "Use agent_wait or agent_status to observe progress. "
-                "Provider selection guide: call agent_providers first if unsure what's available. "
-                "Prefer 'copilot' for implementation tasks (1x cost, GPT/Claude models). "
-                "Use 'claude' when deep reasoning or Claude's specific tools are needed. "
-                "Use 'codex' when you have an OPENAI_API_KEY and want OpenAI models. "
-                f"Default provider (if omitted): '{DEFAULT_PROVIDER or 'copilot'}'."
+                "Delegate a coding task to an external coding agent (Copilot, Claude Code, or Codex) "
+                "running as a background worker. Returns immediately with a session_id. "
+                "USE THIS when: the user asks to delegate/offload/hand off a task to Copilot or another agent; "
+                "you want to run multiple tasks in parallel without blocking; "
+                "the task is large and you want to preserve your own context window. "
+                "Use agent_send to correct the worker mid-task. Use agent_wait to block until done. "
+                "For a simpler one-shot pattern with no session tracking, use agent_run instead. "
+                "Provider guide: 'copilot' for most implementation tasks (1x cost); "
+                "'claude' for deep reasoning; 'codex' for OpenAI models. "
+                f"Default if omitted: '{DEFAULT_PROVIDER or 'copilot'}'."
             ),
             "inputSchema": {
                 "type": "object",
@@ -114,10 +116,13 @@ def tool_definitions() -> list[dict[str, Any]]:
         {
             "name": "agent_run",
             "description": (
-                "Run a one-shot task on a coding agent and return the output. "
-                "Spawns the agent, waits for completion, then cleans up — no session management needed. "
-                "Use this when you just want a result without persisting the session. "
-                "Use agent_spawn + agent_wait instead if you need to send corrections or run parallel workers."
+                "Delegate a coding task to an external coding agent and return the result. "
+                "One-shot: spawns the agent, blocks until done, cleans up — no session tracking needed. "
+                "USE THIS when: the user asks to 'let Copilot handle this', 'delegate to Copilot', "
+                "'offload to another agent', or 'use Copilot for X'; "
+                "the task is self-contained and needs no mid-task corrections; "
+                "you want to offload implementation work to preserve your own context window. "
+                "Use agent_spawn instead when you need to send corrections or run workers in parallel."
             ),
             "inputSchema": {
                 "type": "object",
