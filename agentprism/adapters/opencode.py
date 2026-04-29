@@ -64,8 +64,8 @@ OPENCODE_MODELS: list[dict[str, str]] = [
     {"id": "openai/gpt-5",                 "multiplier": "1x", "note": "requires openai auth"},
     {"id": "openai/gpt-5-mini",            "multiplier": "0.33x", "note": ""},
     {"id": "github-copilot/claude-sonnet-4.5", "multiplier": "1x", "note": "via copilot subscription"},
-    {"id": "ollama/llama3.1",              "multiplier": "0x", "note": "local Ollama (configure provider first)"},
-    {"id": "ollama/qwen2.5-coder",         "multiplier": "0x", "note": "local Ollama"},
+    {"id": "ollama/qwen2.5-coder:14b-8k",  "multiplier": "0x", "note": "local Ollama — configure provider in ~/.config/opencode/config.json"},
+    {"id": "ollama/qwen2.5:14b",           "multiplier": "0x", "note": "local Ollama reasoning"},
 ]
 
 
