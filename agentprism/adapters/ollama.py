@@ -148,15 +148,18 @@ class OllamaAdapter(AgentAdapter):
         self._start_turn(sess)
         return session_id
 
-    async def send(self, session_id: str, message: str) -> str:
+    async def resume(self, session_id: str, message: str) -> str:
         sess = self._require(session_id)
-        # Wait for any in-flight turn to finish before queueing the next.
-        await sess.done_event.wait()
+        if sess.status == "working":
+            raise RuntimeError(
+                "session_busy: call agent_wait first; agent_resume cannot deliver "
+                "a message to a turn that is already running."
+            )
         sess.done_event.clear()
         sess.status = "working"
         sess.messages.append({"role": "user", "content": message})
         self._start_turn(sess)
-        return "message sent — use agent_wait or agent_status to observe"
+        return "resumed — use agent_wait or agent_status to observe"
 
     async def status(self, session_id: str) -> str:
         sess = self._require(session_id)
@@ -276,40 +279,45 @@ class OllamaAdapter(AgentAdapter):
             s.all_chunks.append({"kind": "text", "text": c})
 
         try:
-            await loop.run_in_executor(None, _stream_blocking)
-        except asyncio.CancelledError:
+            try:
+                await loop.run_in_executor(None, _stream_blocking)
+            except asyncio.CancelledError:
+                sess.in_flight = False
+                sess.status = "done"
+                sess.output = "".join(text_parts)
+                raise
+
             sess.in_flight = False
-            sess.status = "done"
             sess.output = "".join(text_parts)
+
+            if error and not sess.output.strip():
+                error_lower = error.lower()
+                if "connection" in error_lower or "refused" in error_lower or "unreachable" in error_lower:
+                    quota_err: QuotaExceededError | None = QuotaExceededError(
+                        "ollama", sess.model, "Ollama server not running or no models available"
+                    )
+                else:
+                    quota_err = detect_quota_error(error, "ollama", sess.model)
+                if quota_err:
+                    sess.status = "error"
+                    sess.output = str(quota_err)
+                    sess.all_chunks.append({"kind": "text", "text": f"[error] {sess.output}\n"})
+                else:
+                    sess.status = "error"
+                    sess.output = error
+                    sess.all_chunks.append({"kind": "text", "text": f"[error] {error}\n"})
+            else:
+                sess.status = "done"
+                # Persist assistant turn into history for follow-ups.
+                if sess.output:
+                    sess.messages.append({"role": "assistant", "content": sess.output})
+        except Exception as e:
+            sess.in_flight = False
+            sess.status = "error"
+            sess.output = f"ollama turn crashed: {e}"
+            log.exception("ollama turn crashed")
+        finally:
             sess.done_event.set()
-            raise
-
-        sess.in_flight = False
-        sess.output = "".join(text_parts)
-
-        if error and not sess.output.strip():
-            error_lower = error.lower()
-            if "connection" in error_lower or "refused" in error_lower or "unreachable" in error_lower:
-                quota_err: QuotaExceededError | None = QuotaExceededError(
-                    "ollama", sess.model, "Ollama server not running or no models available"
-                )
-            else:
-                quota_err = detect_quota_error(error, "ollama", sess.model)
-            if quota_err:
-                sess.status = "error"
-                sess.output = str(quota_err)
-                sess.all_chunks.append({"kind": "text", "text": f"[error] {sess.output}\n"})
-            else:
-                sess.status = "error"
-                sess.output = error
-                sess.all_chunks.append({"kind": "text", "text": f"[error] {error}\n"})
-        else:
-            sess.status = "done"
-            # Persist assistant turn into history for follow-ups.
-            if sess.output:
-                sess.messages.append({"role": "assistant", "content": sess.output})
-
-        sess.done_event.set()
         log.info(
             "ollama turn done (status=%s, output=%d chars)",
             sess.status, len(sess.output),

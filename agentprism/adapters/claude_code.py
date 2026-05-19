@@ -186,6 +186,7 @@ class ClaudeCodeAdapter(AgentAdapter):
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
         )
 
         sess = _Session(
@@ -203,17 +204,23 @@ class ClaudeCodeAdapter(AgentAdapter):
         await self._write_user_message(sess, task)
         return session_id
 
-    async def send(self, session_id: str, message: str) -> str:
-        """Send a follow-up message non-blocking — use agent_wait/status to observe."""
+    async def resume(self, session_id: str, message: str) -> str:
+        """Kick off a new turn by writing ``message`` to the running claude_code stdin.
+
+        Non-blocking; raises if a turn is already in flight (agent_wait first).
+        """
         sess = self._require(session_id)
         async with sess.send_lock:
             if sess.state == "working":
-                await self._await_turn(sess, timeout=None)
+                raise RuntimeError(
+                    "session_busy: call agent_wait first; agent_resume cannot deliver "
+                    "a message to a turn that is already running."
+                )
             sess.turn_done.clear()
             sess.pending_text.clear()
             sess.state = "working"
             await self._write_user_message(sess, message)
-        return "message sent — use agent_wait or agent_status to observe"
+        return "resumed — use agent_wait or agent_status to observe"
 
     async def status(self, session_id: str) -> str:
         sess = self._require(session_id)
@@ -244,20 +251,30 @@ class ClaudeCodeAdapter(AgentAdapter):
         try:
             await asyncio.wait_for(sess.proc.wait(), timeout=2.0)
         except TimeoutError:
-            try:
-                sess.proc.send_signal(signal.SIGTERM)
-                await asyncio.wait_for(sess.proc.wait(), timeout=2.0)
-            except (TimeoutError, ProcessLookupError):
+            from agentprism.proc_utils import IS_WINDOWS, kill_process_group
+            if not IS_WINDOWS and sess.proc.returncode is None:
+                await kill_process_group(sess.proc.pid)
+            else:
                 try:
-                    sess.proc.kill()
-                except ProcessLookupError:
-                    pass
+                    sess.proc.send_signal(signal.SIGTERM)
+                    await asyncio.wait_for(sess.proc.wait(), timeout=2.0)
+                except (TimeoutError, ProcessLookupError):
+                    try:
+                        sess.proc.kill()
+                    except ProcessLookupError:
+                        pass
         if sess.reader_task is not None:
             sess.reader_task.cancel()
             try:
                 await sess.reader_task
             except (asyncio.CancelledError, Exception):
                 pass
+
+    def child_pid(self, session_id: str) -> int | None:
+        sess = self._sessions.get(session_id)
+        if sess is not None and sess.proc is not None:
+            return sess.proc.pid
+        return None
 
     @classmethod
     def models(cls) -> list[dict]:

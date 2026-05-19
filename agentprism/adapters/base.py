@@ -79,8 +79,18 @@ class AgentAdapter(ABC):
         """
 
     @abstractmethod
-    async def send(self, session_id: str, message: str) -> str:
-        """Send a follow-up message and block until the agent responds."""
+    async def resume(self, session_id: str, message: str) -> str:
+        """Start a new turn on an existing session with ``message``.
+
+        Non-blocking: kicks off the next turn (typically via the provider's
+        ``--resume`` / thread-id mechanism) and returns a short confirmation
+        immediately. Callers observe progress via :meth:`wait` / :meth:`status`.
+
+        Implementations MUST raise if the session is currently ``"working"`` —
+        the caller is expected to ``agent_wait`` first. There is no in-flight
+        message delivery: every provider's protocol is turn-based, so a new
+        message can only become its own turn after the current one ends.
+        """
 
     @abstractmethod
     async def status(self, session_id: str) -> str:
@@ -93,6 +103,14 @@ class AgentAdapter(ABC):
     @abstractmethod
     async def kill(self, session_id: str) -> None:
         """Terminate the subprocess and release resources."""
+
+    def child_pid(self, session_id: str) -> int | None:
+        """Return the PID of the spawned worker, or None for non-subprocess adapters.
+
+        Subprocess adapters override this so the registry can persist the PID
+        for orphan recovery after agentprism restarts.
+        """
+        return None
 
     @classmethod
     @abstractmethod

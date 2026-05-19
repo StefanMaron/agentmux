@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
+from agentprism import session_store
 from agentprism.adapters.aider_adapter import AiderAdapter
 from agentprism.adapters.base import AgentAdapter
 from agentprism.adapters.claude_code import ClaudeCodeAdapter
@@ -16,6 +18,7 @@ from agentprism.adapters.copilot import CopilotAdapter
 from agentprism.adapters.gemini import GeminiAdapter
 from agentprism.adapters.ollama import OllamaAdapter
 from agentprism.adapters.opencode import OpenCodeAdapter
+from agentprism.adapters.orphan import OrphanAdapter
 
 log = logging.getLogger("agentprism.session")
 
@@ -92,9 +95,10 @@ class Session:
     initial_task: str
     git_base_sha: str | None = None  # HEAD at spawn time for delta tracking
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    recovered: bool = False  # True if rehydrated from disk after a restart
 
     def summary(self) -> dict:
-        return {
+        out = {
             "session_id": self.session_id,
             "provider": self.provider,
             "cwd": self.cwd,
@@ -102,14 +106,16 @@ class Session:
             "mode": self.mode,
             "created_at": self.created_at.isoformat(),
         }
+        if self.recovered:
+            out["recovered"] = True
+        return out
 
 
 class SessionRegistry:
     """In-memory map of ``session_id`` → :class:`Session`.
 
-    The registry is the single source of truth for spawned agents during the
-    MCP server's lifetime. It's intentionally process-local — restarting
-    agentprism drops all sessions.
+    Sessions are also persisted to ``~/.agentprism/sessions/{session_id}.json``
+    so that subprocesses can be re-attached after an agentprism restart.
     """
 
     def __init__(
@@ -158,10 +164,33 @@ class SessionRegistry:
         async with self._lock:
             self._sessions[session_id] = session
 
+        # Persist the session so it can be recovered if agentprism restarts
+        # while the worker is still running.
+        try:
+            child_pid = adapter.child_pid(session_id)
+            if child_pid:
+                # PGID == PID for processes started with start_new_session=True.
+                pgid = child_pid
+                session_store.write_session({
+                    "session_id": session_id,
+                    "instance_pid": os.getpid(),
+                    "provider": provider,
+                    "model": model,
+                    "mode": mode,
+                    "cwd": cwd,
+                    "initial_task": task,
+                    "git_base_sha": base_sha,
+                    "child_pid": child_pid,
+                    "child_pgid": pgid,
+                    "created_at": session.created_at.isoformat(),
+                    "status": "active",
+                })
+        except Exception as e:
+            log.warning("could not persist session %s: %s", session_id, e)
+
         # Background watcher: when the adapter's initial turn completes,
         # fire the on_complete callback. We treat the initial spawn-turn's
-        # completion as "session done" for notification purposes — that's
-        # the moment the orchestrator wants to be woken up.
+        # completion as "session done" for notification purposes.
         if self._on_complete is not None:
             self._watchers[session_id] = asyncio.create_task(
                 self._watch_completion(session)
@@ -169,19 +198,19 @@ class SessionRegistry:
         return session
 
     async def _watch_completion(self, session: Session) -> None:
-        """Await terminal state on a session and fire the on_complete callback.
-
-        Errors here are logged but never re-raised — completion notification
-        is a best-effort side channel and must not poison the spawn flow.
-        """
+        """Await terminal state on a session and fire the on_complete callback."""
         try:
             try:
                 output = await session.adapter.wait(session.session_id)
             except Exception as exc:
-                # Surface the error in the callback payload rather than
-                # silently dropping the notification — the orchestrator
-                # likely still wants to know the worker is gone.
                 output = f"[adapter error] {type(exc).__name__}: {exc}"
+            # Mark the session done on disk. We keep the file around briefly
+            # so a status query right after completion still finds it; the
+            # next clean kill / shutdown removes it.
+            try:
+                session_store.update_session(session.session_id, status="done")
+            except Exception:
+                pass
             if self._on_complete is not None:
                 try:
                     await self._on_complete(session, output)
@@ -214,16 +243,89 @@ class SessionRegistry:
         finally:
             async with self._lock:
                 self._sessions.pop(session_id, None)
+            try:
+                session_store.remove_session(session_id)
+            except Exception:
+                pass
 
     async def shutdown(self) -> None:
-        """Kill every active session — call on server shutdown."""
+        """Cancel watchers and detach from sessions, leaving subprocesses running.
+
+        This is the key policy change: we no longer kill spawned workers
+        when agentprism stops. Each session's record stays on disk so the
+        next agentprism boot can rehydrate it as a recovered orphan.
+        """
         for task in list(self._watchers.values()):
             if not task.done():
                 task.cancel()
         self._watchers.clear()
-        for session in list(self._sessions.values()):
+        # Intentionally do not call adapter.kill() — let workers run to
+        # completion. The next instance recovers them via session_store.
+        self._sessions.clear()
+
+    def recover_orphans(self) -> int:
+        """Rehydrate sessions whose worker is still alive but whose parent died.
+
+        Stale records (worker also dead) are pruned. Returns the number of
+        sessions added back to the in-memory map. Safe to call once at
+        startup before stdio takes over.
+        """
+        records = session_store.discover_sessions()
+        orphans, dead = session_store.classify_orphans(records, current_pid=os.getpid())
+
+        for rec in dead:
             try:
-                await session.adapter.kill(session.session_id)
+                session_store.remove_session(rec["session_id"])
             except Exception:
                 pass
-        self._sessions.clear()
+
+        recovered = 0
+        for rec in orphans:
+            try:
+                self._reattach_orphan(rec)
+                recovered += 1
+            except Exception as e:
+                log.warning("failed to recover session %s: %s", rec.get("session_id"), e)
+        if recovered:
+            log.info("recovered %d orphaned session(s) from previous instance(s)", recovered)
+        return recovered
+
+    def _reattach_orphan(self, rec: dict) -> None:
+        session_id = rec["session_id"]
+        adapter = OrphanAdapter(
+            original_provider=rec.get("provider", "unknown"),
+            pid=int(rec["child_pid"]),
+            pgid=int(rec.get("child_pgid", rec["child_pid"])),
+        )
+        adapter.bind_session_id(session_id)
+
+        created_at_raw = rec.get("created_at")
+        try:
+            created_at = (
+                datetime.fromisoformat(created_at_raw)
+                if created_at_raw
+                else datetime.now(UTC)
+            )
+        except Exception:
+            created_at = datetime.now(UTC)
+
+        session = Session(
+            session_id=session_id,
+            provider=rec.get("provider", "orphan"),
+            adapter=adapter,
+            cwd=rec.get("cwd", ""),
+            model=rec.get("model"),
+            mode=rec.get("mode"),
+            initial_task=rec.get("initial_task", ""),
+            git_base_sha=rec.get("git_base_sha"),
+            created_at=created_at,
+            recovered=True,
+        )
+        self._sessions[session_id] = session
+
+        # Re-claim ownership in the lockfile so a future agentprism doesn't
+        # also try to recover this same session.
+        try:
+            session_store.update_session(session_id, instance_pid=os.getpid())
+        except Exception:
+            pass

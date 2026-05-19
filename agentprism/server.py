@@ -53,6 +53,13 @@ def build_server() -> tuple[Server, SessionRegistry, MCPContextHolder]:
         await notify_session_complete(session, output, holder)
 
     registry = SessionRegistry(on_complete=_on_session_complete)
+    # Rehydrate orphan sessions from previous agentprism instances whose
+    # workers are still alive. Done here (before stdio starts) so the very
+    # first agent_list call already sees them.
+    try:
+        registry.recover_orphans()
+    except Exception:
+        log.exception("orphan recovery failed")
     dispatcher = ToolDispatcher(registry)
 
     @server.list_tools()
@@ -124,7 +131,12 @@ async def run(dashboard_port: int | None = None) -> None:
                 server.create_initialization_options(),
             )
     finally:
-        log.info("agentprism shutting down — killing %d sessions", len(registry.list()))
+        active = len(registry.list())
+        log.info(
+            "agentprism shutting down — detaching from %d session(s); "
+            "workers stay alive and will be re-attached by the next instance",
+            active,
+        )
         await registry.shutdown()
         holder.clear()
         remove_lock()

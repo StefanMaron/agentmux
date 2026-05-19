@@ -147,21 +147,23 @@ class CodexAdapter(AgentAdapter):
         await self._launch(cmd, sess)
         return session_id
 
-    async def send(self, session_id: str, message: str) -> str:
-        """Send a follow-up turn, blocking until it completes.
+    async def resume(self, session_id: str, message: str) -> str:
+        """Kick off a new Codex turn on the existing session, non-blocking.
 
         Uses ``codex exec resume <thread_id>`` so the new turn shares the
-        same conversation history as the original ``spawn()`` call. If the
-        previous turn is still running we wait for it to finish first.
+        same conversation history as the original ``spawn()`` call. Raises
+        if a turn is already running — agent_wait first.
         """
         sess = self._require_session(session_id)
         codex_bin = _find_codex()
         if not codex_bin:
             raise NotInstalledError(_INSTALL_HINT)
 
-        # Make sure the previous turn settled before starting a new one.
         if sess.state == "working":
-            await sess.done_event.wait()
+            raise RuntimeError(
+                "session_busy: call agent_wait first; agent_resume cannot deliver "
+                "a message to a turn that is already running."
+            )
 
         # Reset per-turn state.
         sess.events.clear()
@@ -177,8 +179,7 @@ class CodexAdapter(AgentAdapter):
             resume_thread_id=sess.thread_id,
         )
         await self._launch(cmd, sess)
-        await sess.done_event.wait()
-        return self._collect_output(sess)
+        return "resumed — use agent_wait or agent_status to observe"
 
     async def status(self, session_id: str) -> str:
         sess = self._require_session(session_id)
@@ -196,19 +197,30 @@ class CodexAdapter(AgentAdapter):
         sess = self._require_session(session_id)
         proc = sess.proc
         if proc and proc.returncode is None:
-            try:
-                proc.terminate()
+            from agentprism.proc_utils import IS_WINDOWS, kill_process_group
+            if not IS_WINDOWS:
+                await kill_process_group(proc.pid)
+            else:
                 try:
-                    await asyncio.wait_for(proc.wait(), timeout=5.0)
-                except TimeoutError:
-                    proc.kill()
-                    await proc.wait()
-            except ProcessLookupError:
-                pass
+                    proc.terminate()
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=5.0)
+                    except TimeoutError:
+                        proc.kill()
+                        await proc.wait()
+                except ProcessLookupError:
+                    pass
         if sess.reader_task and not sess.reader_task.done():
             sess.reader_task.cancel()
         sess.state = "done" if sess.state != "error" else "error"
         sess.done_event.set()
+
+    def child_pid(self, session_id: str) -> int | None:
+        try:
+            sess = self._require_session(session_id)
+        except (KeyError, ValueError):
+            return None
+        return sess.proc.pid if sess.proc is not None else None
 
     @classmethod
     def models(cls) -> list[dict]:
@@ -327,6 +339,7 @@ class CodexAdapter(AgentAdapter):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
+            start_new_session=True,
         )
         sess.proc = proc
         sess.reader_task = asyncio.create_task(self._drain(proc, sess))

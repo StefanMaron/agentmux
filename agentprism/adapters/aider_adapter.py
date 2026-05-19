@@ -138,13 +138,17 @@ class AiderAdapter(AgentAdapter):
         await self._run_turn(sess, task)
         return session_id
 
-    async def send(self, session_id: str, message: str) -> str:
+    async def resume(self, session_id: str, message: str) -> str:
         sess = self._require(session_id)
-        await sess.done_event.wait()
+        if sess.status == "working":
+            raise RuntimeError(
+                "session_busy: call agent_wait first; agent_resume cannot deliver "
+                "a message to a turn that is already running."
+            )
         sess.done_event.clear()
         sess.status = "working"
         await self._run_turn(sess, message)
-        return "message sent — use agent_wait or agent_status to observe"
+        return "resumed — use agent_wait or agent_status to observe"
 
     async def status(self, session_id: str) -> str:
         sess = self._require(session_id)
@@ -161,18 +165,28 @@ class AiderAdapter(AgentAdapter):
     async def kill(self, session_id: str) -> None:
         sess = self._require(session_id)
         if sess.proc and sess.proc.returncode is None:
-            try:
-                sess.proc.terminate()
-                await asyncio.wait_for(sess.proc.wait(), timeout=3.0)
-            except Exception:
+            from agentprism.proc_utils import IS_WINDOWS, kill_process_group
+            if not IS_WINDOWS:
+                await kill_process_group(sess.proc.pid)
+            else:
                 try:
-                    sess.proc.kill()
+                    sess.proc.terminate()
+                    await asyncio.wait_for(sess.proc.wait(), timeout=3.0)
                 except Exception:
-                    pass
+                    try:
+                        sess.proc.kill()
+                    except Exception:
+                        pass
         if self._drain_task and not self._drain_task.done():
             self._drain_task.cancel()
         sess.status = "done"
         sess.done_event.set()
+
+    def child_pid(self, session_id: str) -> int | None:
+        sess = self._session
+        if sess and sess.session_id == session_id and sess.proc is not None:
+            return sess.proc.pid
+        return None
 
     @property
     def _all_chunks(self) -> list[dict]:
@@ -231,6 +245,7 @@ class AiderAdapter(AgentAdapter):
             stderr=asyncio.subprocess.PIPE,
             cwd=sess.cwd,
             env=env,
+            start_new_session=True,
         )
         sess.done_event.clear()
         sess.status = "working"
@@ -264,20 +279,25 @@ class AiderAdapter(AgentAdapter):
                 text_parts.append(raw)
                 sess.all_chunks.append({"kind": "text", "text": raw})
 
-        await asyncio.gather(read_stdout(), read_stderr())
-        await sess.proc.wait()
+        try:
+            await asyncio.gather(read_stdout(), read_stderr())
+            await sess.proc.wait()
 
-        sess.output = "".join(text_parts)
+            sess.output = "".join(text_parts)
 
-        if sess.proc.returncode != 0 and not sess.output.strip():
-            err = b"".join(stderr_chunks).decode("utf-8", errors="replace")
+            if sess.proc.returncode != 0 and not sess.output.strip():
+                err = b"".join(stderr_chunks).decode("utf-8", errors="replace")
+                sess.status = "error"
+                sess.output = err or f"aider exited with code {sess.proc.returncode}"
+            else:
+                sess.status = "done"
+            log.info(
+                "aider turn done (rc=%s, output=%d chars)",
+                sess.proc.returncode, len(sess.output),
+            )
+        except Exception as e:
             sess.status = "error"
-            sess.output = err or f"aider exited with code {sess.proc.returncode}"
-        else:
-            sess.status = "done"
-
-        sess.done_event.set()
-        log.info(
-            "aider turn done (rc=%s, output=%d chars)",
-            sess.proc.returncode, len(sess.output),
-        )
+            sess.output = f"drain crashed: {e}"
+            log.exception("aider drain crashed")
+        finally:
+            sess.done_event.set()

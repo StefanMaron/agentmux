@@ -2,7 +2,7 @@
 
 **A universal MCP server that exposes coding agents as background subagents behind a single, unified tool interface.**
 
-agentprism lets one AI agent orchestrate other AI agents. Drop it into your MCP client (Claude Code, Cursor, Continue, …) and gain nine tools — `agent_run`, `agent_spawn`, `agent_send`, `agent_wait`, `agent_status`, `agent_list`, `agent_kill`, `agent_models`, `agent_providers` — that drive any supported coding agent through its native CLI. Run several in parallel, hand off tasks between them, or use a cheaper/local model as a worker while a more expensive planner directs it.
+agentprism lets one AI agent orchestrate other AI agents. Drop it into your MCP client (Claude Code, Cursor, Continue, …) and gain nine tools — `agent_run`, `agent_spawn`, `agent_resume`, `agent_wait`, `agent_status`, `agent_list`, `agent_kill`, `agent_models`, `agent_providers` — that drive any supported coding agent through its native CLI. Run several in parallel, hand off tasks between them, or use a cheaper/local model as a worker while a more expensive planner directs it.
 
 **8 providers out of the box:** GitHub Copilot, Claude Code, Codex, Gemini CLI, Ollama (local), OpenCode, Aider.
 
@@ -92,7 +92,7 @@ Open `http://localhost:7070` to see every active session across every project, g
 | `agent_models`     | `provider?`                                       | model ids + cost multipliers                     |
 | `agent_run`        | `task`, `cwd`, `provider?`, `model?`, `timeout?`  | output — one-shot, blocks until done, auto-cleans |
 | `agent_spawn`      | `task`, `cwd`, `provider?`, `model?`, `mode?`     | `session_id` — non-blocking, persistent          |
-| `agent_send`       | `session_id`, `message`                           | non-blocking — use `agent_wait` to observe       |
+| `agent_resume`     | `session_id`, `message`                           | start a new turn on an existing session — must not be `working` |
 | `agent_status`     | `session_id`                                      | status + git delta + activity info               |
 | `agent_wait`       | `session_id`, `timeout_seconds?`                  | accumulated output + git delta (blocks)          |
 | `agent_list`       | —                                                 | all active sessions                              |
@@ -100,7 +100,9 @@ Open `http://localhost:7070` to see every active session across every project, g
 
 **`agent_status`** returns `process_alive`, `last_activity_seconds_ago`, `uptime_seconds`, `new_commits`, and `working_tree_changes` — enough to decide whether a session is stuck without calling `agent_wait`.
 
-**`agent_wait` / `agent_run`** include `new_commits` and `working_tree_changes` in the result — no need to run `git log` or `git status` separately.
+**`agent_wait` / `agent_run`** include `new_commits` and `working_tree_changes` in the result — no need to run `git log` or `git status` separately. Each call is capped server-side at `AGENTPRISM_WAIT_CAP_SECONDS` (default 60); if the worker is still running when the cap fires, the response is `{status: "still_running", ...}` and the caller should call `agent_wait` again. The worker is left alive across the gap. This prevents long jobs from outliving the MCP host's per-tool-call timeout.
+
+**Session persistence & recovery.** Every spawn writes `~/.agentprism/sessions/{session_id}.json` capturing the worker PID and PGID. If agentprism dies (host crash, restart, MCP disconnect), workers keep running — they're in their own process group, not children of the host. The next agentprism instance scans those files on startup and rehydrates any session whose worker is still alive, so `agent_list` / `agent_status` / `agent_kill` keep working across restarts. Recovered sessions show `recovered: true` in `agent_list`. `agent_resume` is unavailable on recovered sessions (the original stdin pipe is gone) — kill and respawn if you need to redirect.
 
 **`mode`** values (Copilot / Claude Code): `agent` (default), `plan`, `autopilot`
 
@@ -194,7 +196,7 @@ Trigger conditions:
 Quick patterns:
 - One-shot:          agent_run(task, cwd)
 - Parallel workers:  multiple agent_spawn calls, then agent_wait each
-- With corrections:  agent_spawn → agent_wait → agent_send → agent_wait → agent_kill
+- Follow-up turns:   agent_spawn → agent_wait → agent_resume → agent_wait → agent_kill
 - Free brainstorm:   agent_run(task, cwd, provider="ollama", model="qwen2.5:14b")
 - Free Gemini:       agent_run(task, cwd, provider="gemini", model="gemini-2.5-flash")
 
@@ -242,6 +244,7 @@ Environment variables:
 |----------------------------|--------------|------------------------------------------------|
 | `AGENTPRISM_LOG_LEVEL`     | `INFO`       | Python logging level (logs go to stderr)       |
 | `AGENTPRISM_DEFAULT_PROVIDER` | `copilot` | Provider used when `provider` arg is omitted   |
+| `AGENTPRISM_WAIT_CAP_SECONDS` | `60`      | Server-side cap on each `agent_wait`/`agent_run` call. When the cap fires before the worker finishes, the response has `status: "still_running"` and the caller should call `agent_wait` again. Avoids tearing down the MCP stdio channel on long jobs. |
 | `AGENTPRISM_COPILOT_BIN`   | `copilot`    | Path to the `copilot` binary                   |
 | `AGENTPRISM_CLAUDE_BIN`    | `claude`     | Path to the `claude` binary                    |
 | `AGENTPRISM_CODEX_BIN`     | `codex`      | Path to the `codex` binary                     |
